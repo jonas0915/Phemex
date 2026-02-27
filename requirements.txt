@@ -1,0 +1,7 @@
+ccxt==4.3.89
+pandas==2.2.3
+numpy==2.0.2
+ta==0.11.0
+python-dotenv==1.0.1
+schedule==1.2.2
+requests==2.32.3
