@@ -1,9 +1,11 @@
 """
-simulate.py — Offline trade simulation using synthetic BTC price data.
-No API keys or live exchange connection required.
+simulate.py — Multi-trade offline simulation using synthetic BTC price data.
+Exercises ScalpStrategy + RiskManager with intra-candle TP/SL detection.
+No API keys required.
 
 Usage:
-    python simulate.py
+    python simulate.py           # 100 trades (default)
+    python simulate.py 50        # custom trade count
 """
 
 from __future__ import annotations
@@ -15,30 +17,29 @@ import time
 
 import numpy as np
 
-# ── Inject dummy env vars before any bot module is imported ────────────────
+# ── Patch env before importing bot modules ─────────────────────────────────
 os.environ.update({
-    "PHEMEX_API_KEY":            "SIM_KEY",
-    "PHEMEX_API_SECRET":         "SIM_SECRET",
-    "PHEMEX_TESTNET":            "true",
-    "TRADING_SYMBOL":            "BTC/USDT:USDT",
-    "TRADING_TIMEFRAME":         "1m",
-    "TRADE_SIZE_USDT":           "100",
-    "LEVERAGE":                  "5",
-    "EMA_FAST":                  "9",
-    "EMA_SLOW":                  "21",
-    "RSI_PERIOD":                "14",
-    "RSI_OVERBOUGHT":            "70",
-    "RSI_OVERSOLD":              "30",
-    "MAX_SESSION_LOSS_PCT":      "30",
-    "TAKE_PROFIT_PCT":           "0.6",
-    "STOP_LOSS_PCT":             "0.35",
-    "MAX_CONCURRENT_TRADES":     "1",
-    "TRADE_COOLDOWN_SECONDS":    "0",   # no cooldown delay in simulation
-    "LOG_LEVEL":                 "WARNING",
-    "LOG_FILE":                  "logs/sim.log",
+    "PHEMEX_API_KEY":          "SIM_KEY",
+    "PHEMEX_API_SECRET":       "SIM_SECRET",
+    "PHEMEX_TESTNET":          "true",
+    "TRADING_SYMBOL":          "BTC/USDT:USDT",
+    "TRADING_TIMEFRAME":       "1m",
+    "TRADE_SIZE_USDT":         "100",
+    "LEVERAGE":                "5",
+    "EMA_FAST":                "9",
+    "EMA_SLOW":                "21",
+    "RSI_PERIOD":              "14",
+    "RSI_OVERBOUGHT":          "70",
+    "RSI_OVERSOLD":            "30",
+    "MAX_SESSION_LOSS_PCT":    "30",
+    "TAKE_PROFIT_PCT":         "0.6",
+    "STOP_LOSS_PCT":           "0.35",
+    "MAX_CONCURRENT_TRADES":   "1",
+    "TRADE_COOLDOWN_SECONDS":  "0",
+    "LOG_LEVEL":               "WARNING",
+    "LOG_FILE":                "logs/sim.log",
 })
 
-# Suppress logging noise during simulation
 import logging
 logging.disable(logging.WARNING)
 
@@ -46,7 +47,7 @@ from strategy import ScalpStrategy, Signal, StrategyResult  # noqa: E402
 from risk_manager import RiskManager, OpenTrade             # noqa: E402
 from config import Config                                   # noqa: E402
 
-# ── Colour helpers ─────────────────────────────────────────────────────────
+# ── ANSI colours ───────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -55,262 +56,356 @@ BOLD   = "\033[1m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
 
-
-def c(text: str, colour: str) -> str:
-    return f"{colour}{text}{RESET}"
+def g(t: str) -> str: return f"{GREEN}{t}{RESET}"
+def r(t: str) -> str: return f"{RED}{t}{RESET}"
+def y(t: str) -> str: return f"{YELLOW}{t}{RESET}"
+def cy(t: str) -> str: return f"{CYAN}{t}{RESET}"
+def b(t: str) -> str: return f"{BOLD}{t}{RESET}"
+def d(t: str) -> str: return f"{DIM}{t}{RESET}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Synthetic price generator
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_candles(n: int = 200, seed: int = 42) -> list[list]:
+def generate_candles(n_candles: int = 8000, seed: int = 42) -> list[list]:
     """
-    Generate synthetic 1-minute OHLCV candles designed to produce at least
-    two EMA crossover signals (one bullish, one bearish).
+    Produces alternating trend cycles with moderate drift and deliberate
+    RSI cool-down phases so that EMA crossovers fire when RSI is in the
+    strategy's acceptance window (30–60 for LONG, 40–70 for SHORT).
 
-    Segments:
-        0-35   : flat noise (warmup — lets EMAs stabilise)
-        35-75  : uptrend   → bullish EMA9/EMA21 crossover ~candle 55
-        75-100 : sharp drop → stop-loss test
-        100-140: slow recovery with new uptrend
-        140-170: downtrend  → bearish EMA9/EMA21 crossover ~candle 155
-        170-200: flat tail
+    Cycle ≈ 76 candles → ~2 trades:
+        8  flat      → RSI resets to ~50, EMAs converge
+        30 up        → gentle slope; EMA9 crosses EMA21 ~candle 18 at RSI ≈ 54
+        8  flat      → RSI cools before downtrend
+        30 down      → gentle slope; EMA9 crosses below EMA21 ~candle 18 at RSI ≈ 46
     """
     rng = np.random.default_rng(seed)
-    base = 43_000.0
-    closes: list[float] = [base]
+    closes: list[float] = [43_000.0]
 
-    def _segment(n_bars: int, drift: float, vol: float) -> list[float]:
-        prices = []
+    def add(n: int, drift: float, vol: float) -> None:
         p = closes[-1]
-        for _ in range(n_bars):
-            p = p * (1 + rng.normal(drift, vol))
-            prices.append(round(p, 2))
-        return prices
+        for _ in range(n):
+            p = max(100.0, p * (1.0 + rng.normal(drift, vol)))
+            closes.append(round(p, 2))
 
-    closes += _segment(35,  0.00000, 0.0008)   # flat
-    closes += _segment(40,  0.00060, 0.0006)   # uptrend
-    closes += _segment(25, -0.00120, 0.0010)   # sharp drop
-    closes += _segment(40,  0.00045, 0.0007)   # recovery
-    closes += _segment(30, -0.00070, 0.0007)   # downtrend
-    closes += _segment(30,  0.00010, 0.0006)   # flat tail
+    add(40, 0.0, 0.0003)           # warm-up
 
-    closes = closes[:n]
-    ts_start = int(time.time()) * 1000 - len(closes) * 60_000
+    while len(closes) < n_candles:
+        add(8,   0.0,       0.0002)  # flat: RSI → 50, EMAs converge
+        add(30,  0.00030,   0.00040) # gentle uptrend: cross at RSI ~54
+        add(8,   0.0,       0.0002)  # flat: RSI cools
+        add(30, -0.00030,   0.00040) # gentle downtrend: cross at RSI ~46
 
-    candles = []
+    closes = closes[:n_candles]
+    ts_base = int(time.time()) * 1000 - len(closes) * 60_000
+
+    candles: list[list] = []
     for i, close in enumerate(closes):
-        noise_hi = rng.uniform(0.0001, 0.0006) * close
-        noise_lo = rng.uniform(0.0001, 0.0006) * close
-        open_  = closes[i - 1] if i > 0 else close
-        high   = max(open_, close) + noise_hi
-        low    = min(open_, close) - noise_lo
-        vol    = rng.uniform(0.5, 5.0)
-        candles.append([ts_start + i * 60_000, open_, high, low, close, vol])
+        prev   = closes[i - 1] if i > 0 else close
+        hi_ext = rng.uniform(0.0001, 0.0005) * close
+        lo_ext = rng.uniform(0.0001, 0.0005) * close
+        candles.append([
+            ts_base + i * 60_000,
+            round(prev, 2),
+            round(max(prev, close) + hi_ext, 2),
+            round(min(prev, close) - lo_ext, 2),
+            close,
+            round(rng.uniform(0.5, 5.0), 3),
+        ])
 
     return candles
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Display helpers
+# Intra-candle TP / SL check  (uses candle high/low, not just close)
 # ══════════════════════════════════════════════════════════════════════════════
 
-W = 66  # box width
+def check_candle_exit(trade: OpenTrade, candle: list) -> tuple[str | None, float]:
+    """
+    Returns (reason, exact_exit_price) if TP or SL is breached inside the candle.
+    SL takes priority when both levels are touched (gap candle).
+    """
+    _ts, _o, high, low, _c, _v = candle
 
-def header(text: str) -> None:
-    print(c("═" * W, CYAN))
-    print(c(f"  {text}", BOLD + CYAN))
-    print(c("═" * W, CYAN))
+    if trade.side == "long":
+        sl_hit = low  <= trade.stop_loss
+        tp_hit = high >= trade.take_profit
+        if sl_hit:
+            return "stop_loss",   trade.stop_loss
+        if tp_hit:
+            return "take_profit", trade.take_profit
+    else:
+        sl_hit = high >= trade.stop_loss
+        tp_hit = low  <= trade.take_profit
+        if sl_hit:
+            return "stop_loss",   trade.stop_loss
+        if tp_hit:
+            return "take_profit", trade.take_profit
 
-
-def box(lines: list[tuple[str, str, str]]) -> None:
-    """Print a box. Each line is (label, value, colour)."""
-    print(c("  ┌" + "─" * (W - 4) + "┐", DIM))
-    for label, value, col in lines:
-        content = f"  {label:<22}{c(value, col)}"
-        print(f"  │  {label:<20}{c(value, col)}")
-    print(c("  └" + "─" * (W - 4) + "┘", DIM))
-
-
-def _box(title: str, rows: list[tuple[str, str, str]]) -> None:
-    bar = "─" * (W - 4)
-    print(f"  {DIM}┌─ {RESET}{BOLD}{title}{RESET}{DIM} {'─' * (W - 7 - len(title))}┐{RESET}")
-    for label, value, col in rows:
-        pad = W - 8 - len(label) - len(value)
-        print(f"  {DIM}│{RESET}  {label:<24}{col}{value}{RESET}{' ' * max(0, pad)}{DIM}│{RESET}")
-    print(f"  {DIM}└{bar}┘{RESET}")
-
-
-def signal_badge(signal: Signal) -> str:
-    if signal == Signal.LONG:
-        return c("▲ LONG", GREEN + BOLD)
-    if signal == Signal.SHORT:
-        return c("▼ SHORT", RED + BOLD)
-    return c("· hold", DIM)
-
-
-def pnl_colour(pnl: float) -> str:
-    return GREEN if pnl >= 0 else RED
+    return None, 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Simulation engine
+# ASCII equity curve
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_simulation() -> None:
+def equity_curve(balances: list[float], target_width: int = 60, height: int = 8) -> str:
+    """Area chart of cumulative balance across all completed trades."""
+    if len(balances) < 2:
+        return ""
+
+    # Downsample to target width
+    n = len(balances)
+    if n > target_width:
+        idx = [int(round(i * (n - 1) / (target_width - 1))) for i in range(target_width)]
+        sampled = [balances[i] for i in idx]
+    else:
+        sampled = list(balances)
+
+    lo = min(sampled) * 0.9995
+    hi = max(sampled) * 1.0005
+    span = hi - lo or 1.0
+    w = len(sampled)
+
+    lines: list[str] = []
+    for row in range(height, 0, -1):
+        thresh      = lo + span * (row / height)
+        prev_thresh = lo + span * ((row - 1) / height)
+        label = f"{thresh:>9,.0f}" if row % 2 == 0 else " " * 9
+        bar = ""
+        for val in sampled:
+            if val >= thresh:
+                bar += "▓"
+            elif val >= prev_thresh:
+                bar += "░"
+            else:
+                bar += " "
+        lines.append(f"  {label} │{bar}│")
+
+    lines.append(f"           └{'─' * w}┘")
+    mid = w // 2
+    lines.append(f"           1{' ' * (mid - 2)}{mid}{' ' * (w - mid - len(str(w)))}{w}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main simulation
+# ══════════════════════════════════════════════════════════════════════════════
+
+W = 76  # display width
+
+def run_simulation(target_trades: int = 100) -> None:
     starting_balance = 1_000.0
-    candles = generate_candles(n=200)
+    all_candles = generate_candles(n_candles=max(12000, target_trades * 120))
 
     strategy = ScalpStrategy()
-    rm = RiskManager(starting_balance)
+    rm       = RiskManager(starting_balance)
 
-    header(
-        f"PHEMEX SCALP BOT — TRADE SIMULATION  "
-        f"({len(candles)} × 1m candles)"
-    )
-    print(f"  Symbol   : {Config.SYMBOL}")
-    print(f"  Leverage : {Config.LEVERAGE}x")
-    print(f"  Trade sz : {Config.TRADE_SIZE_USDT} USDT  "
-          f"(notional {Config.TRADE_SIZE_USDT * Config.LEVERAGE:.0f} USDT)")
-    print(f"  Balance  : {starting_balance:,.2f} USDT  |  "
-          f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%  "
-          f"({starting_balance * Config.MAX_SESSION_LOSS_PCT / 100:.2f} USDT)")
-    print(f"  TP: +{Config.TAKE_PROFIT_PCT}%   SL: -{Config.STOP_LOSS_PCT}%")
+    # ── Header ────────────────────────────────────────────────────────────────
+    print(cy("═" * W))
+    print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE SIMULATION")))
+    print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  "
+             f"{Config.LEVERAGE}x leverage  │  {Config.TRADE_SIZE_USDT} USDT / trade  │  "
+             f"Notional: {Config.TRADE_SIZE_USDT * Config.LEVERAGE:.0f} USDT"))
+    print(cy(f"  Balance: {starting_balance:,.2f} USDT  │  "
+             f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%  │  "
+             f"TP: +{Config.TAKE_PROFIT_PCT}%  │  SL: -{Config.STOP_LOSS_PCT}%"))
+    print(cy("═" * W))
     print()
 
-    print(c(f"  {'Candle':>6}  {'Close':>10}  {'EMA9':>10}  {'EMA21':>10}  "
-            f"{'RSI':>6}  Signal", DIM))
-    print(c("  " + "─" * 62, DIM))
+    # ── Table header ──────────────────────────────────────────────────────────
+    print(d(f"  {'#':>4}  {'Side':<6}  {'Entry':>10}  {'Exit':>10}  "
+            f"{'Result':<10}  {'PnL':>8}  {'Balance':>11}  {'Loss%':>6}"))
+    print(d("  " + "─" * (W - 2)))
 
-    trade_num = 0
+    # ── State ─────────────────────────────────────────────────────────────────
+    balance:      float             = starting_balance
+    balances:     list[float]       = [starting_balance]
+    completed:    int               = 0
+    current_trade: OpenTrade | None = None
+    trade_log:    list[dict]        = []
 
-    for i in range(Config.MIN_CANDLES, len(candles)):
-        window = candles[: i + 1]
-        current_price = candles[i][4]  # close
+    for i in range(Config.MIN_CANDLES, len(all_candles)):
+        candle = all_candles[i]
+        close  = float(candle[4])
 
-        # ── Manage open trade ────────────────────────────────────────────────
-        if rm.open_trade is not None:
-            exit_reason = rm.check_exit_conditions(current_price)
+        # ── Manage open position ───────────────────────────────────────────────
+        if current_trade is not None:
+            reason, exit_price = check_candle_exit(current_trade, candle)
 
-            if exit_reason:
-                record = rm.register_close(current_price, exit_reason)
-                col = GREEN if record.pnl_usdt >= 0 else RED
-                label = "TAKE PROFIT ✓" if exit_reason == "take_profit" else "STOP LOSS ✗"
+            if reason:
+                record = rm.register_close(exit_price, reason)
+                completed += 1
+                pnl     = record.pnl_usdt
+                balance = starting_balance + rm._realised_pnl
+                balances.append(balance)
 
-                print()
-                _box(f"TRADE #{trade_num} CLOSED — {label}", [
-                    ("Reason",        label,                        col),
-                    ("Exit price",    f"{current_price:>12,.2f} USDT", col),
-                    ("PnL",           f"{record.pnl_usdt:>+.4f} USDT",  col),
-                    ("Session PnL",   f"{rm._realised_pnl:>+.4f} USDT",
-                                      pnl_colour(rm._realised_pnl)),
-                    ("Session loss",  f"{rm.session_loss_pct:.2f}%",
-                                      RED if rm.session_loss_pct > 10 else RESET),
-                    ("Remaining risk",f"{rm.remaining_risk_usdt:.2f} USDT", YELLOW),
-                ])
-                print()
+                tp_hit     = reason == "take_profit"
+                result_str = (g("TP ✓") if tp_hit else r("SL ✗"))
+                pnl_str    = (g if pnl >= 0 else r)(f"{pnl:>+7.2f}")
+                side_str   = g("LONG  ") if current_trade.side == "long" else r("SHORT ")
+                loss_col   = RED if rm.session_loss_pct > 15 else YELLOW if rm.session_loss_pct > 5 else DIM
+
+                print(
+                    f"  {completed:>4}  {side_str}"
+                    f"  {current_trade.entry_price:>10,.2f}"
+                    f"  {exit_price:>10,.2f}"
+                    f"  {result_str}        "
+                    f"{pnl_str}"
+                    f"  {balance:>11,.4f}"
+                    f"  {loss_col}{rm.session_loss_pct:>5.1f}%{RESET}"
+                )
+
+                trade_log.append({
+                    "num":   completed,
+                    "side":  current_trade.side,
+                    "entry": current_trade.entry_price,
+                    "exit":  exit_price,
+                    "pnl":   pnl,
+                    "tp":    tp_hit,
+                })
+                current_trade = None
+
+                # ── Checkpoint every 10 trades ─────────────────────────────────
+                if completed % 10 == 0 and completed < target_trades:
+                    wins_n  = sum(1 for t in trade_log if t["pnl"] > 0)
+                    pct_chg = (balance / starting_balance - 1) * 100
+                    chk_col = g if pct_chg >= 0 else r
+                    print(d(
+                        f"  ── {completed} trades  Balance: {balance:,.2f} USDT "
+                        f"({chk_col(f'{pct_chg:+.2f}%')})  "
+                        f"W/L: {wins_n}/{completed - wins_n} "
+                        + "─" * 10
+                    ))
 
                 if rm.session_locked:
-                    print(c(f"\n  !! SESSION LOCKED — cumulative loss "
-                            f"{rm.session_loss_pct:.1f}% reached {Config.MAX_SESSION_LOSS_PCT}% limit !!\n",
-                            RED + BOLD))
+                    print()
+                    print(r(b(
+                        f"  !! SESSION LOCKED — loss {rm.session_loss_pct:.1f}% "
+                        f"hit {Config.MAX_SESSION_LOSS_PCT}% limit !!"
+                    )))
                     break
 
-            else:
-                t = rm.open_trade
-                side_str = c("LONG  ▲", GREEN) if t.side == "long" else c("SHORT ▼", RED)
-                dist_tp = abs(t.take_profit - current_price)
-                dist_sl = abs(t.stop_loss - current_price)
-                print(f"  {i:>6}  {current_price:>10,.2f}  "
-                      f"{'─':>10}  {'─':>10}  {'─':>6}  "
-                      f"Holding {side_str}  "
-                      f"{DIM}TP-{dist_tp:.1f}  SL-{dist_sl:.1f}{RESET}")
+                if completed >= target_trades:
+                    break
+
+            continue  # hold — don't look for new signal this tick
+
+        # ── Stop if done ───────────────────────────────────────────────────────
+        if rm.session_locked or completed >= target_trades:
+            break
+
+        # ── Evaluate strategy (rolling 200-candle window for speed) ───────────
+        window_start = max(0, i - 199)
+        result = strategy.analyse(all_candles[window_start: i + 1])
+        if result is None or result.signal == Signal.NONE:
             continue
 
-        # ── Analyse strategy ─────────────────────────────────────────────────
-        result: StrategyResult | None = strategy.analyse(window)
-        if result is None:
-            continue
-
-        sig_str = signal_badge(result.signal)
-        print(f"  {i:>6}  {result.current_price:>10,.2f}  "
-              f"{result.ema_fast:>10,.2f}  {result.ema_slow:>10,.2f}  "
-              f"{result.rsi:>6.1f}  {sig_str}")
-
-        # ── Open trade on signal ─────────────────────────────────────────────
-        if result.signal == Signal.NONE:
-            continue
-
-        allowed, reason = rm.can_open_trade()
+        allowed, _ = rm.can_open_trade()
         if not allowed:
-            print(c(f"         Trade blocked: {reason}", DIM))
             continue
 
-        trade_num += 1
-        notional = Config.TRADE_SIZE_USDT * Config.LEVERAGE
-        contracts = round(notional / current_price, 6)
-
-        open_trade = OpenTrade(
-            trade_id=str(uuid.uuid4())[:8],
-            side=result.signal.value,
-            entry_price=current_price,
-            contracts=contracts,
-            take_profit=result.take_profit,
-            stop_loss=result.stop_loss,
+        # ── Open position ──────────────────────────────────────────────────────
+        notional  = Config.TRADE_SIZE_USDT * Config.LEVERAGE
+        contracts = round(notional / close, 6)
+        current_trade = OpenTrade(
+            trade_id    = str(uuid.uuid4())[:8],
+            side        = result.signal.value,
+            entry_price = close,
+            contracts   = contracts,
+            take_profit = result.take_profit,
+            stop_loss   = result.stop_loss,
         )
-        rm.register_open(open_trade)
+        rm.register_open(current_trade)
 
-        side_col = GREEN if result.signal == Signal.LONG else RED
-        tp_pct = (result.take_profit / current_price - 1) * 100
-        sl_pct = (result.stop_loss  / current_price - 1) * 100
-
-        print()
-        _box(f"TRADE #{trade_num} OPENED", [
-            ("Side",         result.signal.value.upper(),      side_col),
-            ("Entry price",  f"{current_price:>12,.2f} USDT",  side_col),
-            ("Contracts",    f"{contracts:.6f}",                RESET),
-            ("Notional",     f"{notional:,.2f} USDT ({Config.LEVERAGE}x)", RESET),
-            ("Take profit",  f"{result.take_profit:,.2f} USDT  ({tp_pct:+.2f}%)", GREEN),
-            ("Stop loss",    f"{result.stop_loss:,.2f} USDT  ({sl_pct:+.2f}%)",   RED),
-            ("EMA9 / EMA21", f"{result.ema_fast:,.2f} / {result.ema_slow:,.2f}",  RESET),
-            ("RSI",          f"{result.rsi:.1f}",              YELLOW),
-        ])
-        print()
-
-    # ── Final summary ────────────────────────────────────────────────────────
-    # Close any remaining open position at last price
-    if rm.open_trade is not None:
-        last_price = candles[-1][4]
-        record = rm.register_close(last_price, "session_end")
+    # ── Force-close any remaining open trade ──────────────────────────────────
+    if current_trade is not None:
+        last_close = float(all_candles[-1][4])
+        record = rm.register_close(last_close, "session_end")
         if record:
-            col = pnl_colour(record.pnl_usdt)
-            print()
-            _box("TRADE CLOSED — SESSION END", [
-                ("Exit price", f"{last_price:,.2f} USDT", col),
-                ("PnL",        f"{record.pnl_usdt:+.4f} USDT", col),
-            ])
+            completed += 1
+            balance = starting_balance + rm._realised_pnl
+            balances.append(balance)
+            pnl = record.pnl_usdt
+            print(
+                f"  {completed:>4}  "
+                f"{'LONG  ' if current_trade.side == 'long' else 'SHORT '}"
+                f"  {current_trade.entry_price:>10,.2f}"
+                f"  {last_close:>10,.2f}"
+                f"  {d('END       ')}"
+                f"  {(g if pnl >= 0 else r)(f'{pnl:>+7.2f}')}"
+                f"  {balance:>11,.4f}"
+                f"  {d(f'{rm.session_loss_pct:>5.1f}%')}"
+            )
+            trade_log.append({
+                "num": completed, "side": current_trade.side,
+                "entry": current_trade.entry_price, "exit": last_close,
+                "pnl": pnl, "tp": False,
+            })
 
-    s = rm.session_summary()
-    net_col = pnl_colour(s["realised_pnl"])
+    # ── Summary ────────────────────────────────────────────────────────────────
+    wins   = [t for t in trade_log if t["pnl"] > 0]
+    losses = [t for t in trade_log if t["pnl"] <= 0]
+    net    = rm._realised_pnl
+    net_pct = (net / starting_balance) * 100
+
+    best  = max(trade_log, key=lambda t: t["pnl"]) if trade_log else None
+    worst = min(trade_log, key=lambda t: t["pnl"]) if trade_log else None
+
+    # Max drawdown
+    peak   = starting_balance
+    max_dd = 0.0
+    for bal in balances:
+        if bal > peak:
+            peak = bal
+        dd = (peak - bal) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+
+    def row(label: str, value: str, col: str = RESET) -> None:
+        print(f"  {label:<28}{col}{value}{RESET}")
 
     print()
-    print(c("═" * W, CYAN))
-    print(c(f"  SESSION SUMMARY", BOLD + CYAN))
-    print(c("═" * W, CYAN))
-    print(f"  Starting balance : {s['start_balance']:>10,.2f} USDT")
-    print(f"  Total trades     : {s['total_trades']:>10}  "
-          f"({c(str(s['wins']) + ' wins', GREEN)}  /  "
-          f"{c(str(s['losses']) + ' losses', RED)})")
-    print(f"  Win rate         : {s['win_rate_pct']:>9.1f}%")
-    pnl_str = f"{s['realised_pnl']:+.4f} USDT"
-    print(f"  Realised PnL     : {c(pnl_str, net_col):>10}")
-    print(f"  Session loss     : {s['session_loss_pct']:>9.2f}%  "
-          f"(limit {Config.MAX_SESSION_LOSS_PCT}%)")
-    print(f"  Session locked   : {s['session_locked']}")
-    print(c("═" * W, CYAN))
+    print(cy("═" * W))
+    print(cy(b(f"  SESSION SUMMARY — {completed} TRADES")))
+    print(cy("═" * W))
+
+    bal_col = GREEN if net >= 0 else RED
+    row("Starting balance",  f"{starting_balance:,.2f} USDT")
+    row("Final balance",     f"{balance:,.2f} USDT", bal_col)
+    print()
+    row("Total trades",      str(completed))
+    print(f"  {'Wins / Losses':<28}"
+          f"{g(str(len(wins)) + ' wins')}  /  {r(str(len(losses)) + ' losses')}")
+    wr = len(wins) / completed * 100 if completed else 0
+    row("Win rate",          f"{wr:.1f}%", GREEN if wr >= 50 else YELLOW)
+    print()
+    net_col = GREEN if net >= 0 else RED
+    row("Net PnL",           f"{net:>+.4f} USDT  ({net_pct:>+.2f}%)", net_col)
+    if wins:
+        avg_win = sum(t["pnl"] for t in wins) / len(wins)
+        row("  Avg win",     f"{avg_win:>+.4f} USDT", GREEN)
+    if losses:
+        avg_loss = sum(t["pnl"] for t in losses) / len(losses)
+        row("  Avg loss",    f"{avg_loss:>+.4f} USDT", RED)
+    if best:
+        row("  Best trade",  f"{best['pnl']:>+.4f} USDT  (trade #{best['num']})", GREEN)
+    if worst:
+        row("  Worst trade", f"{worst['pnl']:>+.4f} USDT  (trade #{worst['num']})", RED)
+    print()
+    dd_col = RED if max_dd > 15 else YELLOW if max_dd > 8 else GREEN
+    row("Max drawdown",      f"{max_dd:.2f}%", dd_col)
+    row("Session loss",      f"{rm.session_loss_pct:.2f}%  (limit {Config.MAX_SESSION_LOSS_PCT}%)")
+    row("Session locked",    str(rm.session_locked))
+
+    print()
+    print(cy("  Equity Curve  (balance over completed trades)"))
+    print(equity_curve(balances, target_width=60))
+    print(cy("═" * W))
     print()
 
 
 if __name__ == "__main__":
-    run_simulation()
+    trades = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    run_simulation(target_trades=trades)
