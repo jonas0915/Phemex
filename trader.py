@@ -48,7 +48,8 @@ class Trader:
         ticker = self.exchange.fetch_ticker()
         current_price = float(ticker.get("last", ohlcv[-1][4]))
 
-        # 3. Check live balance vs session limit
+        # 3. Fetch live balance for session limit check and compound sizing
+        balance: Optional[float] = None
         try:
             balance = self.exchange.fetch_usdt_balance()
             self.rm.update_current_balance(balance)
@@ -76,14 +77,35 @@ class Trader:
             log.debug("Trade blocked: %s", reason)
             return
 
-        # 8. Open trade
-        self._open_trade(result, current_price)
+        # 8. Open trade (pass live balance for compound sizing)
+        self._open_trade(result, current_price, balance)
 
     # ── Trade management ──────────────────────────────────────────────────────
 
-    def _open_trade(self, result: StrategyResult, current_price: float) -> None:
+    def _open_trade(
+        self,
+        result: StrategyResult,
+        current_price: float,
+        balance: Optional[float] = None,
+    ) -> None:
         side = "buy" if result.signal == Signal.LONG else "sell"
-        qty = self.exchange.calculate_order_qty(current_price)
+
+        # Compound sizing: risk a % of current balance when configured
+        if Config.RISK_PER_TRADE_PCT > 0 and balance is not None and balance > 0:
+            trade_usdt = balance * (Config.RISK_PER_TRADE_PCT / 100)
+            notional = trade_usdt * Config.LEVERAGE
+            try:
+                market = self.exchange._exchange.market(Config.SYMBOL)
+                precision = market.get("precision", {}).get("amount", 6)
+            except Exception:  # noqa: BLE001
+                precision = 6
+            qty = round(notional / current_price, precision)
+            log.info(
+                "Compound sizing | balance=%.2f risk=%.1f%% notional=%.2f qty=%.6f",
+                balance, Config.RISK_PER_TRADE_PCT, notional, qty,
+            )
+        else:
+            qty = self.exchange.calculate_order_qty(current_price)
 
         order = self.exchange.place_market_order(side, qty)
         if order is None:

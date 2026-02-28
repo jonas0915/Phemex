@@ -46,6 +46,10 @@ class Config:
     STOP_LOSS_PCT: float = _get("STOP_LOSS_PCT", default="0.35", cast=float)
     MAX_CONCURRENT_TRADES: int = _get("MAX_CONCURRENT_TRADES", default="1", cast=int)
     TRADE_COOLDOWN_SECONDS: int = _get("TRADE_COOLDOWN_SECONDS", default="30", cast=int)
+    # Compound sizing: when > 0, risk this % of current account balance per trade
+    # (multiplied by LEVERAGE). Set to 0 to use the fixed TRADE_SIZE_USDT instead.
+    # Example: 20 with LEVERAGE=25 → each trade = 5× the current balance notional
+    RISK_PER_TRADE_PCT: float = _get("RISK_PER_TRADE_PCT", default="0", cast=float)
 
     # ── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = _get("LOG_LEVEL", default="INFO")

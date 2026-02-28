@@ -24,8 +24,8 @@ os.environ.update({
     "PHEMEX_TESTNET":          "true",
     "TRADING_SYMBOL":          "BTC/USDT:USDT",
     "TRADING_TIMEFRAME":       "1m",
-    "TRADE_SIZE_USDT":         "100",
-    "LEVERAGE":                "5",
+    "TRADE_SIZE_USDT":         "200",    # base fallback size (USDT)
+    "LEVERAGE":                "25",     # risk-on: 25× leverage
     "EMA_FAST":                "9",
     "EMA_SLOW":                "21",
     "RSI_PERIOD":              "14",
@@ -36,6 +36,7 @@ os.environ.update({
     "STOP_LOSS_PCT":           "0.35",
     "MAX_CONCURRENT_TRADES":   "1",
     "TRADE_COOLDOWN_SECONDS":  "0",
+    "RISK_PER_TRADE_PCT":      "20",     # compound sizing: 20% of balance per trade
     "LOG_LEVEL":               "WARNING",
     "LOG_FILE":                "logs/sim.log",
 })
@@ -203,11 +204,12 @@ def run_simulation(target_trades: int = 100) -> None:
     rm       = RiskManager(starting_balance)
 
     # ── Header ────────────────────────────────────────────────────────────────
+    effective_x = Config.RISK_PER_TRADE_PCT / 100 * Config.LEVERAGE
     print(cy("═" * W))
-    print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE SIMULATION")))
-    print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  "
-             f"{Config.LEVERAGE}x leverage  │  {Config.TRADE_SIZE_USDT} USDT / trade  │  "
-             f"Notional: {Config.TRADE_SIZE_USDT * Config.LEVERAGE:.0f} USDT"))
+    print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE SIMULATION  [RISK-ON]")))
+    print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  {Config.LEVERAGE}x leverage"))
+    print(cy(f"  Compound sizing: {Config.RISK_PER_TRADE_PCT:.0f}% of balance × "
+             f"{Config.LEVERAGE}x = {effective_x:.1f}× account exposure per trade"))
     print(cy(f"  Balance: {starting_balance:,.2f} USDT  │  "
              f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%  │  "
              f"TP: +{Config.TAKE_PROFIT_PCT}%  │  SL: -{Config.STOP_LOSS_PCT}%"))
@@ -306,9 +308,12 @@ def run_simulation(target_trades: int = 100) -> None:
         if not allowed:
             continue
 
-        # ── Open position ──────────────────────────────────────────────────────
-        notional  = Config.TRADE_SIZE_USDT * Config.LEVERAGE
-        contracts = round(notional / close, 6)
+        # ── Open position with compound sizing ────────────────────────────────
+        # Risk RISK_PER_TRADE_PCT% of the current (growing) balance each trade.
+        # This compounds profits: bigger balance → bigger notional → bigger wins.
+        trade_usdt = balance * (Config.RISK_PER_TRADE_PCT / 100)
+        notional   = trade_usdt * Config.LEVERAGE
+        contracts  = round(notional / close, 6)
         current_trade = OpenTrade(
             trade_id    = str(uuid.uuid4())[:8],
             side        = result.signal.value,
