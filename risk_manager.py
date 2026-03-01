@@ -71,6 +71,10 @@ class RiskManager:
         self._open_trade: Optional[OpenTrade] = None
         self._last_trade_at: float = 0.0
 
+        # Consecutive-loss cooldown state
+        self._consecutive_losses: int = 0
+        self._cooldown_bars_remaining: int = 0
+
         log.info(
             "RiskManager initialised | start_balance=%.2f USDT | "
             "max_loss=%.1f%% (%.2f USDT)",
@@ -110,7 +114,8 @@ class RiskManager:
         Checks:
           - Session not locked due to max loss
           - No open position already
-          - Cooldown period respected
+          - Trade cooldown (time-based) respected
+          - Consecutive-loss cooldown (candle-based) respected
         """
         if self._session_locked:
             return False, (
@@ -126,7 +131,24 @@ class RiskManager:
             remaining = Config.TRADE_COOLDOWN_SECONDS - elapsed
             return False, f"Cooldown active ({remaining:.0f}s remaining)"
 
+        if self._cooldown_bars_remaining > 0:
+            return False, (
+                f"Consecutive-loss cooldown "
+                f"({self._cooldown_bars_remaining} bars remaining)"
+            )
+
         return True, "OK"
+
+    def on_new_candle(self) -> None:
+        """
+        Call once per candle (tick) to decrement the consecutive-loss cooldown.
+        In live trading: call at the start of each bot tick.
+        In simulation: call at the start of each candle iteration.
+        """
+        if self._cooldown_bars_remaining > 0:
+            self._cooldown_bars_remaining -= 1
+            if self._cooldown_bars_remaining == 0:
+                log.info("Consecutive-loss cooldown expired — trading resumed")
 
     def register_open(self, trade: OpenTrade) -> None:
         """Call immediately after an order is filled."""
@@ -173,8 +195,13 @@ class RiskManager:
         else:
             pnl = (t.entry_price - exit_price) * t.contracts
 
-        # Fee: 0.075% taker per side, applied to both entry and exit notional
-        fee = (t.entry_price + exit_price) * t.contracts * 0.00075
+        # Fees: maker entry earns a -0.025% rebate; exit is always taker at +0.075%.
+        # Taker-taker (no maker entry): 0.075% + 0.075% = 0.15% round trip.
+        # Maker-taker (USE_MAKER_ENTRY): -0.025% + 0.075% = 0.05% round trip.
+        if Config.USE_MAKER_ENTRY:
+            fee = exit_price * t.contracts * 0.00075 - t.entry_price * t.contracts * 0.00025
+        else:
+            fee = (t.entry_price + exit_price) * t.contracts * 0.00075
         pnl -= fee
 
         record = TradeRecord(
@@ -192,6 +219,19 @@ class RiskManager:
         self._trade_history.append(record)
         self._open_trade = None
         self._last_trade_at = time.time()
+
+        # Track consecutive losses and trigger cooldown
+        if pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= Config.CONSEC_LOSS_LIMIT:
+                self._cooldown_bars_remaining = Config.CONSEC_LOSS_COOLDOWN_BARS
+                self._consecutive_losses = 0
+                log.info(
+                    "%d consecutive losses — cooling down for %d candles",
+                    Config.CONSEC_LOSS_LIMIT, Config.CONSEC_LOSS_COOLDOWN_BARS,
+                )
+        else:
+            self._consecutive_losses = 0   # win resets the streak
 
         log.info(
             "Trade closed | id=%s reason=%s exit=%.4f pnl=%.4f USDT | "

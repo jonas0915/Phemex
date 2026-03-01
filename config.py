@@ -48,8 +48,8 @@ class Config:
 
     # ── Risk management ──────────────────────────────────────────────────────
     MAX_SESSION_LOSS_PCT:   float = _get("MAX_SESSION_LOSS_PCT",   default="30",   cast=float)
-    TAKE_PROFIT_PCT:        float = _get("TAKE_PROFIT_PCT",        default="0.6",  cast=float)
-    STOP_LOSS_PCT:          float = _get("STOP_LOSS_PCT",          default="0.35", cast=float)
+    TAKE_PROFIT_PCT:        float = _get("TAKE_PROFIT_PCT",        default="0.7",  cast=float)
+    STOP_LOSS_PCT:          float = _get("STOP_LOSS_PCT",          default="0.25", cast=float)
     MAX_CONCURRENT_TRADES:  int   = _get("MAX_CONCURRENT_TRADES",  default="1",    cast=int)
     TRADE_COOLDOWN_SECONDS: int   = _get("TRADE_COOLDOWN_SECONDS", default="30",   cast=int)
 
@@ -62,6 +62,44 @@ class Config:
     # after entry so the position is protected even if the bot crashes or loses
     # connectivity.  Set False only for paper-trading / testnet debugging.
     USE_EXCHANGE_SL_TP: bool = _get("USE_EXCHANGE_SL_TP", default="true").lower() == "true"
+
+    # ── Trend strength filter (ADX) ───────────────────────────────────────────
+    # Average Directional Index: quantifies trend strength regardless of direction.
+    # ADX < 20 → choppy/ranging → skip entry (EMA crossovers are noise here).
+    # ADX ≥ 20 → trending → enter with confidence.
+    ADX_PERIOD:    int   = _get("ADX_PERIOD",    default="14",   cast=int)
+    ADX_THRESHOLD: float = _get("ADX_THRESHOLD", default="20.0", cast=float)
+
+    # ── ATR-based dynamic TP / SL ─────────────────────────────────────────────
+    # Average True Range adapts TP/SL to actual market volatility.
+    # Low-vol (ranging): tighter stops → better R:R.  High-vol (trending): wider.
+    # TP = ATR_TP_MULT × ATR   (default ≈ 0.6% in normal BTC 1m conditions)
+    # SL = ATR_SL_MULT × ATR   (default ≈ 0.25% → R:R ≈ 2.4×)
+    # Set USE_ATR_STOPS=false to revert to fixed TAKE_PROFIT_PCT / STOP_LOSS_PCT.
+    USE_ATR_STOPS: bool  = _get("USE_ATR_STOPS", default="true").lower() == "true"
+    ATR_PERIOD:    int   = _get("ATR_PERIOD",    default="14",   cast=int)
+    ATR_TP_MULT:   float = _get("ATR_TP_MULT",   default="6.0",  cast=float)
+    ATR_SL_MULT:   float = _get("ATR_SL_MULT",   default="2.5",  cast=float)
+
+    # ── EMA slope gate ────────────────────────────────────────────────────────
+    # Fast EMA must be actively trending in the signal direction.
+    # Measures slope over last EMA_SLOPE_BARS candles.
+    # Filters out "flat" crossovers that occur at trend exhaustion.
+    EMA_SLOPE_BARS: int = _get("EMA_SLOPE_BARS", default="3", cast=int)
+
+    # ── Medium-term trend confirmation ────────────────────────────────────────
+    # Require close[-1] > close[-N] for LONG, close[-1] < close[-N] for SHORT.
+    # Ensures we trade WITH the recent N-bar directional bias, not against it.
+    # In GBM trending regimes (drift ±0.0002/bar, 20–80 bars), this correctly
+    # aligns entries with the ongoing regime, dramatically cutting counter-trend
+    # entries. Set 0 to disable.
+    TREND_CONFIRM_BARS: int = _get("TREND_CONFIRM_BARS", default="0", cast=int)
+
+    # ── Consecutive-loss cooldown ─────────────────────────────────────────────
+    # After CONSEC_LOSS_LIMIT losses in a row, pause for CONSEC_LOSS_COOLDOWN_BARS
+    # candles. Prevents compounding losses during choppy losing streaks.
+    CONSEC_LOSS_LIMIT:         int = _get("CONSEC_LOSS_LIMIT",         default="3", cast=int)
+    CONSEC_LOSS_COOLDOWN_BARS: int = _get("CONSEC_LOSS_COOLDOWN_BARS", default="5", cast=int)
 
     # ── Order book / L2 filters ───────────────────────────────────────────────
     # Number of order book price levels to fetch (20 is more than enough)

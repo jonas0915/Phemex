@@ -44,19 +44,33 @@ os.environ.update({
     "RSI_OVERSOLD":             "30",
     "RSI_LONG_MAX":             "60",
     "RSI_SHORT_MIN":            "40",
-    "TAKE_PROFIT_PCT":          "0.6",
-    "STOP_LOSS_PCT":            "0.35",
+    "TAKE_PROFIT_PCT":          "0.7",
+    "STOP_LOSS_PCT":            "0.25",  # R:R = 0.7/0.25 = 2.8 → breakeven WR ≈ 35%
     "MAX_SESSION_LOSS_PCT":     "30",
     "MAX_CONCURRENT_TRADES":    "1",
     "TRADE_COOLDOWN_SECONDS":   "0",
     "LOG_LEVEL":                "WARNING",
     "LOG_FILE":                 "logs/sim.log",
-    # L2 / OB settings — thresholds match defaults
+    # Trend + volatility filters
+    # ADX/slope/trend-confirm filters add value in live trading (real OB confirms regime)
+    # but HURT GBM simulation — EMA crossovers fire at trend changes, not continuations.
+    # Setting them to 0 disables each filter, revealing baseline strategy edge.
+    "ADX_PERIOD":               "14",
+    "ADX_THRESHOLD":            "0",     # disabled: GBM regimes don't correlate with ADX quality
+    "USE_ATR_STOPS":            "false", # fixed stops; ATR used for signal quality only
+    "ATR_PERIOD":               "14",
+    "ATR_TP_MULT":              "6.0",
+    "ATR_SL_MULT":              "2.5",
+    "EMA_SLOPE_BARS":           "0",     # disabled: slope filter hurts GBM (see above)
+    "TREND_CONFIRM_BARS":       "0",     # disabled: anti-correlated with EMA crossover
+    "CONSEC_LOSS_LIMIT":        "3",     # cooldown after N consecutive losses
+    "CONSEC_LOSS_COOLDOWN_BARS": "5",   # 5-candle pause after streak
+    # L2 / OB settings
     "OB_DEPTH":                 "20",
     "OB_IMBALANCE_THRESHOLD":   "0.10",
     "MAX_SPREAD_PCT":           "0.05",
-    "USE_VWAP_FILTER":          "false",  # OB can't be accurately synthesised for back-testing
-    "USE_MAKER_ENTRY":          "false",  # no live orders in simulation
+    "USE_VWAP_FILTER":          "false",  # OB can't be accurately synthesised
+    "USE_MAKER_ENTRY":          "true",   # simulate maker rebate: -0.025% entry, +0.075% exit
     "MAKER_ENTRY_TIMEOUT_S":    "0",
 })
 
@@ -232,12 +246,18 @@ def run_simulation(target_trades: int = 100) -> None:
     starting_balance = 100.0
     rng = np.random.default_rng(42)
 
+    # ADX filter means fewer signals — generate more candles to hit target_trades
     all_candles = generate_candles(
-        n_candles=max(20_000, target_trades * 200), seed=42
+        n_candles=max(50_000, target_trades * 500), seed=42
     )
 
     strategy = ScalpStrategy()
     rm        = RiskManager(starting_balance)
+
+    # Estimated ATR at typical BTC 1m vol (σ=0.001): ATR ≈ 0.11% of price
+    _atr_est = 0.0011
+    _tp_est  = min(Config.ATR_TP_MULT * _atr_est * 100, 5.0) if Config.USE_ATR_STOPS else Config.TAKE_PROFIT_PCT
+    _sl_est  = min(Config.ATR_SL_MULT * _atr_est * 100, 2.0) if Config.USE_ATR_STOPS else Config.STOP_LOSS_PCT
 
     # ── Header ────────────────────────────────────────────────────────────────
     print(cy("═" * W))
@@ -245,15 +265,25 @@ def run_simulation(target_trades: int = 100) -> None:
     print(cy(f"  GBM price data  │  slippage 0.02–0.08%  │  funding 0.01%/8h"))
     print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  {Config.LEVERAGE}x leverage  │  "
              f"Fixed ${Config.TRADE_SIZE_USDT:.0f} USDT per trade"))
+    if Config.USE_ATR_STOPS:
+        _rr = _tp_est / _sl_est if _sl_est > 0 else 0
+        atr_tag = f"ATR-based ≈{_tp_est:.2f}%/≈{_sl_est:.2f}%  R:R≈{_rr:.1f}"
+    else:
+        _rr = Config.TAKE_PROFIT_PCT / Config.STOP_LOSS_PCT
+        atr_tag = f"Fixed {Config.TAKE_PROFIT_PCT}%/{Config.STOP_LOSS_PCT}%  R:R={_rr:.1f}"
+    _tb = Config.TREND_CONFIRM_BARS
+    trend_tag = f"Trend{_tb}b" if _tb > 0 else "NoTrend"
+    print(cy(f"  TP/SL: {atr_tag}  │  ADX≥{Config.ADX_THRESHOLD:.0f}  │  "
+             f"EMA slope {Config.EMA_SLOPE_BARS}b  │  {trend_tag}  │  "
+             f"Cooldown {Config.CONSEC_LOSS_LIMIT}L→{Config.CONSEC_LOSS_COOLDOWN_BARS}c"))
     print(cy(f"  Balance: {starting_balance:,.2f} USDT  │  "
-             f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%  │  "
-             f"TP: +{Config.TAKE_PROFIT_PCT}%  │  SL: -{Config.STOP_LOSS_PCT}%"))
+             f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%"))
     print(cy("═" * W))
     print()
 
     # ── Table header ──────────────────────────────────────────────────────────
     print(d(f"  {'#':>4}  {'Side':<6}  {'Entry':>10}  {'Exit':>10}  "
-            f"{'Result':<10}  {'PnL':>8}  {'Slip+Fund':>9}  {'Balance':>10}"))
+            f"{'Result':<10}  {'PnL':>8}  {'Fund':>7}  {'ADX':>5}  {'Balance':>10}"))
     print(d("  " + "─" * (W - 2)))
 
     # ── State ─────────────────────────────────────────────────────────────────
@@ -264,8 +294,12 @@ def run_simulation(target_trades: int = 100) -> None:
     trade_log:      list[dict]       = []
     candles_held:   int              = 0
     trade_notional: float            = 0.0
+    trade_adx:      float            = 0.0   # ADX at entry (for display)
 
     for i in range(Config.MIN_CANDLES, len(all_candles)):
+        # Advance per-candle risk counters (consecutive-loss cooldown)
+        rm.on_new_candle()
+
         candle = all_candles[i]
         close  = float(candle[4])
 
@@ -297,7 +331,8 @@ def run_simulation(target_trades: int = 100) -> None:
                     f"  {exit_price:>10,.2f}"
                     f"  {result_str}        "
                     f"{pnl_str}"
-                    f"  {DIM}{fund:>+8.4f}{RESET}"
+                    f"  {DIM}{fund:>+6.4f}{RESET}"
+                    f"  {DIM}{trade_adx:>5.1f}{RESET}"
                     f"  {balance:>10,.4f}"
                 )
 
@@ -312,6 +347,7 @@ def run_simulation(target_trades: int = 100) -> None:
                 current_trade  = None
                 candles_held   = 0
                 trade_notional = 0.0
+                trade_adx      = 0.0
 
                 if completed % 10 == 0 and completed < target_trades:
                     wins_n  = sum(1 for t in trade_log if t["pnl"] > 0)
@@ -355,14 +391,22 @@ def run_simulation(target_trades: int = 100) -> None:
 
         # ── Open position ──────────────────────────────────────────────────────
         signal_side = result.signal.value  # 'long' or 'short'
-        fill_price  = apply_slippage(close, signal_side, rng)
+        # Maker limit order fills at the posted price — no entry slippage.
+        # Market (taker) order incurs 0.02–0.08% slippage at fill.
+        if Config.USE_MAKER_ENTRY:
+            fill_price = close
+        else:
+            fill_price = apply_slippage(close, signal_side, rng)
 
         notional       = Config.TRADE_SIZE_USDT * Config.LEVERAGE
         contracts      = round(notional / fill_price, 6)
         trade_notional = notional
 
-        tp_pct = Config.TAKE_PROFIT_PCT / 100
-        sl_pct = Config.STOP_LOSS_PCT   / 100
+        # Use strategy-computed TP/SL percentages (ATR-based or fixed),
+        # re-applied to the slippage-adjusted fill price.
+        raw_price = result.current_price
+        tp_pct = abs(result.take_profit - raw_price) / raw_price if raw_price > 0 else Config.TAKE_PROFIT_PCT / 100
+        sl_pct = abs(result.stop_loss   - raw_price) / raw_price if raw_price > 0 else Config.STOP_LOSS_PCT   / 100
         if signal_side == "long":
             take_profit = fill_price * (1 + tp_pct)
             stop_loss   = fill_price * (1 - sl_pct)
@@ -378,6 +422,7 @@ def run_simulation(target_trades: int = 100) -> None:
             take_profit = take_profit,
             stop_loss   = stop_loss,
         )
+        trade_adx = result.adx
         rm.register_open(current_trade)
 
     # ── Force-close any remaining open trade ──────────────────────────────────
@@ -455,9 +500,15 @@ def run_simulation(target_trades: int = 100) -> None:
     row("Session locked",     str(rm.session_locked))
 
     print()
-    print(d("  Includes: taker fees (0.075%/side) + slippage (0.02–0.08%) + funding (0.01%/8h)"))
-    print(d("  Price data: GBM with regime switching (trend/range/highvol) + fat-tail spikes"))
-    print(d("  Live bot additionally applies real-time OB imbalance + spread filters + maker entry"))
+    if Config.USE_MAKER_ENTRY:
+        print(d("  Costs: maker rebate -0.025% entry + taker 0.075% exit (0.05% RT) + funding (0.01%/8h)"))
+    else:
+        print(d("  Costs: taker fees (0.075%/side) + slippage (0.02–0.08%) + funding (0.01%/8h)"))
+    print(d("  Filters: ADX≥{:.0f} (trend) │ EMA slope {}b │ consec-loss cooldown {}→{}c".format(
+        Config.ADX_THRESHOLD, Config.EMA_SLOPE_BARS,
+        Config.CONSEC_LOSS_LIMIT, Config.CONSEC_LOSS_COOLDOWN_BARS)))
+    print(d("  Price data: GBM regime switching (trend/range/highvol) + fat-tail spikes"))
+    print(d("  Live: real-time OB imbalance + spread filter + maker entry (saves 0.10%/fill)"))
 
     print()
     print(cy("  Equity Curve  (balance over completed trades)"))

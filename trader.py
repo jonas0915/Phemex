@@ -39,6 +39,9 @@ class Trader:
     def tick(self) -> None:
         """Execute one iteration of the bot loop."""
 
+        # 0. Advance per-candle risk state (cooldown counters, etc.)
+        self.rm.on_new_candle()
+
         # 1. Fetch fresh candles
         ohlcv = self.exchange.fetch_ohlcv(limit=max(100, Config.MIN_CANDLES + 5))
         if not ohlcv:
@@ -177,9 +180,11 @@ class Trader:
 
         fill_price = float(order.get("average") or order.get("price") or current_price)
 
-        # Recompute TP/SL from actual fill price to account for slippage.
-        tp_pct = Config.TAKE_PROFIT_PCT / 100
-        sl_pct = Config.STOP_LOSS_PCT   / 100
+        # Use the strategy's computed TP/SL percentages (ATR-based or fixed).
+        # Re-apply them to the actual fill price so slippage is accounted for.
+        raw_price = result.current_price
+        tp_pct = abs(result.take_profit - raw_price) / raw_price if raw_price > 0 else Config.TAKE_PROFIT_PCT / 100
+        sl_pct = abs(result.stop_loss   - raw_price) / raw_price if raw_price > 0 else Config.STOP_LOSS_PCT   / 100
         if result.signal == Signal.LONG:
             take_profit = fill_price * (1 + tp_pct)
             stop_loss   = fill_price * (1 - sl_pct)
