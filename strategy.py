@@ -2,8 +2,8 @@
 Scalp trading strategy using EMA crossover + RSI confirmation.
 
 Signal logic:
-  LONG  → EMA_fast crosses ABOVE EMA_slow AND RSI is between oversold & 60
-  SHORT → EMA_fast crosses BELOW EMA_slow AND RSI is between 40 & overbought
+  LONG  → EMA_fast crosses ABOVE EMA_slow AND RSI_OVERSOLD < RSI < RSI_LONG_MAX
+  SHORT → EMA_fast crosses BELOW EMA_slow AND RSI_SHORT_MIN < RSI < RSI_OVERBOUGHT
 
 Both signals require RSI to be in a 'neutral zone' to avoid fading
 an already exhausted move.
@@ -11,6 +11,7 @@ an already exhausted move.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -25,20 +26,20 @@ log = get_logger(__name__)
 
 
 class Signal(Enum):
-    LONG = "long"
+    LONG  = "long"
     SHORT = "short"
-    NONE = "none"
+    NONE  = "none"
 
 
 @dataclass
 class StrategyResult:
-    signal: Signal
+    signal:        Signal
     current_price: float
-    ema_fast: float
-    ema_slow: float
-    rsi: float
-    take_profit: float
-    stop_loss: float
+    ema_fast:      float
+    ema_slow:      float
+    rsi:           float
+    take_profit:   float
+    stop_loss:     float
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -46,12 +47,12 @@ def _ema(series: pd.Series, period: int) -> pd.Series:
 
 
 def _rsi(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
     avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
@@ -63,11 +64,13 @@ class ScalpStrategy:
     def __init__(self) -> None:
         self.ema_fast_period = Config.EMA_FAST
         self.ema_slow_period = Config.EMA_SLOW
-        self.rsi_period = Config.RSI_PERIOD
-        self.rsi_overbought = Config.RSI_OVERBOUGHT
-        self.rsi_oversold = Config.RSI_OVERSOLD
+        self.rsi_period      = Config.RSI_PERIOD
+        self.rsi_overbought  = Config.RSI_OVERBOUGHT
+        self.rsi_oversold    = Config.RSI_OVERSOLD
+        self.rsi_long_max    = Config.RSI_LONG_MAX    # upper RSI bound for LONG entries
+        self.rsi_short_min   = Config.RSI_SHORT_MIN   # lower RSI bound for SHORT entries
         self.take_profit_pct = Config.TAKE_PROFIT_PCT / 100
-        self.stop_loss_pct = Config.STOP_LOSS_PCT / 100
+        self.stop_loss_pct   = Config.STOP_LOSS_PCT   / 100
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -87,7 +90,7 @@ class ScalpStrategy:
 
         df["ema_fast"] = _ema(df["close"], self.ema_fast_period)
         df["ema_slow"] = _ema(df["close"], self.ema_slow_period)
-        df["rsi"] = _rsi(df["close"], self.rsi_period)
+        df["rsi"]      = _rsi(df["close"], self.rsi_period)
 
         # Use last two completed candles (index -2) to detect crossovers.
         # Current (index -1) is the forming candle — we act on its close.
@@ -98,21 +101,23 @@ class ScalpStrategy:
         ema_slow_curr = curr["ema_slow"]
         ema_fast_prev = prev["ema_fast"]
         ema_slow_prev = prev["ema_slow"]
-        rsi = curr["rsi"]
-        price = curr["close"]
+        rsi           = curr["rsi"]
+        price         = curr["close"]
+
+        # Guard against NaN indicators (e.g. flat price series, zero volume)
+        if any(math.isnan(v) for v in (
+            ema_fast_curr, ema_slow_curr, ema_fast_prev, ema_slow_prev, float(rsi)
+        )):
+            log.warning("NaN indicator on candle %d — skipping signal", len(ohlcv))
+            return StrategyResult(
+                signal=Signal.NONE, current_price=float(price),
+                ema_fast=0.0, ema_slow=0.0, rsi=0.0,
+                take_profit=0.0, stop_loss=0.0,
+            )
 
         # Detect crossover
         bullish_cross = (ema_fast_prev <= ema_slow_prev) and (ema_fast_curr > ema_slow_curr)
         bearish_cross = (ema_fast_prev >= ema_slow_prev) and (ema_fast_curr < ema_slow_curr)
-
-        # Guard against NaN indicators (e.g. flat price series, zero volume)
-        import math
-        if any(math.isnan(v) for v in (ema_fast_curr, ema_slow_curr,
-                                        ema_fast_prev, ema_slow_prev, float(rsi))):
-            log.warning("NaN indicator on candle %d — skipping signal", len(ohlcv))
-            return StrategyResult(signal=Signal.NONE, current_price=float(price),
-                                  ema_fast=0.0, ema_slow=0.0, rsi=0.0,
-                                  take_profit=0.0, stop_loss=0.0)
 
         log.debug(
             "EMA fast=%.4f slow=%.4f | RSI=%.2f | bull_x=%s bear_x=%s | price=%.4f",
@@ -122,17 +127,23 @@ class ScalpStrategy:
         signal = Signal.NONE
         tp = sl = 0.0
 
-        if bullish_cross and self.rsi_oversold < rsi < 60:
+        if bullish_cross and self.rsi_oversold < rsi < self.rsi_long_max:
             signal = Signal.LONG
-            tp = price * (1 + self.take_profit_pct)
-            sl = price * (1 - self.stop_loss_pct)
-            log.info("LONG signal | price=%.4f TP=%.4f SL=%.4f RSI=%.2f", price, tp, sl, rsi)
+            tp     = float(price) * (1 + self.take_profit_pct)
+            sl     = float(price) * (1 - self.stop_loss_pct)
+            log.info(
+                "LONG signal | price=%.4f TP=%.4f SL=%.4f RSI=%.2f",
+                price, tp, sl, rsi,
+            )
 
-        elif bearish_cross and 40 < rsi < self.rsi_overbought:
+        elif bearish_cross and self.rsi_short_min < rsi < self.rsi_overbought:
             signal = Signal.SHORT
-            tp = price * (1 - self.take_profit_pct)
-            sl = price * (1 + self.stop_loss_pct)
-            log.info("SHORT signal | price=%.4f TP=%.4f SL=%.4f RSI=%.2f", price, tp, sl, rsi)
+            tp     = float(price) * (1 - self.take_profit_pct)
+            sl     = float(price) * (1 + self.stop_loss_pct)
+            log.info(
+                "SHORT signal | price=%.4f TP=%.4f SL=%.4f RSI=%.2f",
+                price, tp, sl, rsi,
+            )
 
         return StrategyResult(
             signal=signal,

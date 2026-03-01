@@ -44,4 +44,8 @@ def get_logger(name: str) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
+    # Prevent messages from bubbling up to the root logger (avoids duplicates
+    # if the root logger has handlers configured by third-party libraries).
+    logger.propagate = False
+
     return logger

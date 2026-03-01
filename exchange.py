@@ -174,6 +174,70 @@ class PhemexExchange:
             log.error("Failed to place market %s order: %s", side, exc)
             return None
 
+    def place_stop_loss_order(
+        self, side: str, amount: float, stop_price: float
+    ) -> Optional[dict]:
+        """
+        Place a reduce-only stop-market order on the exchange (native SL).
+        Triggered when last price crosses stop_price in the adverse direction.
+        side: 'sell' to protect a long, 'buy' to protect a short.
+        Returns order dict or None on failure (caller falls back to software SL).
+        """
+        if amount <= 0:
+            log.error("Refused SL order — qty must be > 0, got %.6f", amount)
+            return None
+        try:
+            order = self._call(
+                self._exchange.create_order,
+                Config.SYMBOL,
+                "Stop",   # Phemex stop-market type for G-contracts
+                side,
+                amount,
+                None,     # no limit price — triggers a market fill
+                {
+                    "stopPrice":   stop_price,
+                    "reduceOnly":  True,
+                    "triggerType": "ByLastPrice",
+                },
+            )
+            log.info(
+                "Exchange SL order placed | side=%s qty=%.6f trigger=%.4f id=%s",
+                side, amount, stop_price, order.get("id"),
+            )
+            return order
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Exchange-native SL placement failed: %s", exc)
+            return None
+
+    def place_take_profit_order(
+        self, side: str, amount: float, tp_price: float
+    ) -> Optional[dict]:
+        """
+        Place a reduce-only limit order at the take-profit price (native TP).
+        side: 'sell' to close a long, 'buy' to close a short.
+        Returns order dict or None on failure (caller falls back to software TP).
+        """
+        if amount <= 0:
+            log.error("Refused TP order — qty must be > 0, got %.6f", amount)
+            return None
+        try:
+            order = self._call(
+                self._exchange.create_limit_order,
+                Config.SYMBOL,
+                side,
+                amount,
+                tp_price,
+                {"reduceOnly": True},
+            )
+            log.info(
+                "Exchange TP order placed | side=%s qty=%.6f price=%.4f id=%s",
+                side, amount, tp_price, order.get("id"),
+            )
+            return order
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Exchange-native TP placement failed: %s", exc)
+            return None
+
     def place_limit_order(self, side: str, amount: float, price: float) -> Optional[dict]:
         try:
             order = self._call(

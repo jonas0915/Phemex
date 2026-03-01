@@ -43,6 +43,15 @@ def _candle_sleep() -> float:
 
 
 def main() -> None:
+    # ── Validate configuration before doing anything else ────────────────────
+    try:
+        Config.validate()
+    except ValueError as exc:
+        # Log to stderr directly — logger may not be set up yet
+        import sys as _sys
+        _sys.stderr.write(f"STARTUP ERROR: {exc}\n")
+        _sys.exit(1)
+
     log.info("=" * 60)
     log.info("Phemex Scalp Bot starting")
     log.info("Symbol      : %s", Config.SYMBOL)
@@ -56,6 +65,7 @@ def main() -> None:
                  Config.TRADE_SIZE_USDT, Config.LEVERAGE,
                  Config.TRADE_SIZE_USDT * Config.LEVERAGE)
     log.info("Max loss    : %.1f%%", Config.MAX_SESSION_LOSS_PCT)
+    log.info("Native SL/TP: %s", Config.USE_EXCHANGE_SL_TP)
     log.info("Testnet     : %s", Config.TESTNET)
     log.info("=" * 60)
 

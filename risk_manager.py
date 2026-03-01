@@ -24,27 +24,29 @@ log = get_logger(__name__)
 @dataclass
 class TradeRecord:
     """Immutable snapshot of a completed trade."""
-    trade_id: str
-    side: str          # 'long' | 'short'
+    trade_id:    str
+    side:        str    # 'long' | 'short'
     entry_price: float
-    exit_price: float
-    contracts: float
-    pnl_usdt: float
-    reason: str        # 'take_profit' | 'stop_loss' | 'manual' | 'session_close'
-    opened_at: float = field(default_factory=time.time)
-    closed_at: float = field(default_factory=time.time)
+    exit_price:  float
+    contracts:   float
+    pnl_usdt:    float
+    reason:      str    # 'take_profit' | 'stop_loss' | 'manual' | 'session_close' | 'exchange_closed'
+    opened_at:   float = field(default_factory=time.time)
+    closed_at:   float = field(default_factory=time.time)
 
 
 @dataclass
 class OpenTrade:
     """Tracks a currently open position."""
-    trade_id: str
-    side: str
+    trade_id:    str
+    side:        str
     entry_price: float
-    contracts: float
+    contracts:   float
     take_profit: float
-    stop_loss: float
-    opened_at: float = field(default_factory=time.time)
+    stop_loss:   float
+    opened_at:   float = field(default_factory=time.time)
+    sl_order_id: str   = ""   # exchange-native SL order ID (empty = software-only)
+    tp_order_id: str   = ""   # exchange-native TP order ID (empty = software-only)
 
 
 class RiskManager:
@@ -111,7 +113,10 @@ class RiskManager:
           - Cooldown period respected
         """
         if self._session_locked:
-            return False, f"Session locked — cumulative loss {self.session_loss_pct:.1f}% exceeds {self.max_loss_pct}%"
+            return False, (
+                f"Session locked — cumulative loss {self.session_loss_pct:.1f}% "
+                f"exceeds {self.max_loss_pct}%"
+            )
 
         if self._open_trade is not None:
             return False, "Position already open"
@@ -138,6 +143,21 @@ class RiskManager:
             trade.contracts, trade.take_profit, trade.stop_loss,
         )
 
+    def set_order_ids(self, sl_order_id: str, tp_order_id: str) -> None:
+        """
+        Store exchange-native order IDs after placing SL/TP orders.
+        Call this immediately after register_open() when native orders succeed.
+        """
+        if self._open_trade is None:
+            log.warning("set_order_ids called with no open trade — ignoring")
+            return
+        self._open_trade.sl_order_id = sl_order_id
+        self._open_trade.tp_order_id = tp_order_id
+        log.info(
+            "Native orders registered | SL_id=%s TP_id=%s",
+            sl_order_id or "none", tp_order_id or "none",
+        )
+
     def register_close(self, exit_price: float, reason: str) -> Optional[TradeRecord]:
         """
         Call when a position is closed.
@@ -153,8 +173,8 @@ class RiskManager:
         else:
             pnl = (t.entry_price - exit_price) * t.contracts
 
-        # Rough fee estimate: 0.075 % per side (Phemex taker)
-        fee = exit_price * t.contracts * 0.00075 * 2
+        # Fee: 0.075% taker per side, applied to both entry and exit notional
+        fee = (t.entry_price + exit_price) * t.contracts * 0.00075
         pnl -= fee
 
         record = TradeRecord(
@@ -189,6 +209,7 @@ class RiskManager:
         """
         Inspect the open trade against current price.
         Returns exit reason string ('take_profit' | 'stop_loss') or None.
+        This acts as a software safety net alongside exchange-native orders.
         """
         if self._open_trade is None:
             return None
@@ -209,11 +230,14 @@ class RiskManager:
 
     def update_current_balance(self, current_balance: float) -> None:
         """
-        Optional: call periodically with the live account balance to catch
-        unrealised losses that exceed the session limit.
+        Call periodically with the live account balance to catch unrealised
+        losses that exceed the session limit (e.g. during a flash crash).
         """
         unrealised_loss = max(0.0, self.session_start_balance - current_balance)
-        total_loss_pct = (unrealised_loss / self.session_start_balance) * 100 if self.session_start_balance else 0
+        total_loss_pct = (
+            (unrealised_loss / self.session_start_balance) * 100
+            if self.session_start_balance else 0
+        )
 
         if total_loss_pct >= self.max_loss_pct:
             log.warning(
@@ -225,17 +249,18 @@ class RiskManager:
     # ── Reporting ─────────────────────────────────────────────────────────────
 
     def session_summary(self) -> dict:
-        wins = [t for t in self._trade_history if t.pnl_usdt > 0]
+        wins   = [t for t in self._trade_history if t.pnl_usdt > 0]
         losses = [t for t in self._trade_history if t.pnl_usdt <= 0]
         return {
-            "start_balance": self.session_start_balance,
-            "total_trades": len(self._trade_history),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate_pct": (len(wins) / len(self._trade_history) * 100) if self._trade_history else 0,
-            "realised_pnl": round(self._realised_pnl, 4),
+            "start_balance":    self.session_start_balance,
+            "total_trades":     len(self._trade_history),
+            "wins":             len(wins),
+            "losses":           len(losses),
+            "win_rate_pct":     (len(wins) / len(self._trade_history) * 100)
+                                if self._trade_history else 0,
+            "realised_pnl":     round(self._realised_pnl, 4),
             "session_loss_pct": round(self.session_loss_pct, 2),
-            "session_locked": self._session_locked,
+            "session_locked":   self._session_locked,
         }
 
     # ── Private ───────────────────────────────────────────────────────────────
