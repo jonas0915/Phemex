@@ -248,6 +248,52 @@ class RiskManager:
 
     # ── Per-tick checks ───────────────────────────────────────────────────────
 
+    def update_trailing_stop(self, current_price: float) -> Optional[float]:
+        """
+        Trail the stop-loss once price has moved TRAILING_STOP_TRIGGER_PCT
+        of the TP distance toward the target.
+
+        For LONG: SL is raised to (current_price × (1 − dist%)), never lowered.
+        For SHORT: SL is lowered to (current_price × (1 + dist%)), never raised.
+
+        Returns the new SL price if updated, None otherwise.
+        """
+        if not Config.USE_TRAILING_STOP or self._open_trade is None:
+            return None
+
+        t = self._open_trade
+
+        if t.side == "long":
+            tp_dist = t.take_profit - t.entry_price
+            if tp_dist <= 0:
+                return None
+            progress = (current_price - t.entry_price) / tp_dist
+            if progress >= Config.TRAILING_STOP_TRIGGER_PCT:
+                trail_sl = current_price * (1 - Config.TRAILING_STOP_DIST_PCT / 100)
+                if trail_sl > t.stop_loss:
+                    t.stop_loss = trail_sl
+                    log.debug(
+                        "Trailing SL | LONG price=%.4f new_sl=%.4f progress=%.0f%%",
+                        current_price, trail_sl, progress * 100,
+                    )
+                    return trail_sl
+        else:  # short
+            tp_dist = t.entry_price - t.take_profit
+            if tp_dist <= 0:
+                return None
+            progress = (t.entry_price - current_price) / tp_dist
+            if progress >= Config.TRAILING_STOP_TRIGGER_PCT:
+                trail_sl = current_price * (1 + Config.TRAILING_STOP_DIST_PCT / 100)
+                if trail_sl < t.stop_loss:
+                    t.stop_loss = trail_sl
+                    log.debug(
+                        "Trailing SL | SHORT price=%.4f new_sl=%.4f progress=%.0f%%",
+                        current_price, trail_sl, progress * 100,
+                    )
+                    return trail_sl
+
+        return None
+
     def check_exit_conditions(self, current_price: float) -> Optional[str]:
         """
         Inspect the open trade against current price.

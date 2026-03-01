@@ -363,9 +363,25 @@ class Trader:
 
     def _manage_open_trade(self, current_price: float) -> None:
         """Software TP/SL safety net — fires if native orders haven't triggered."""
+        # Update trailing stop first — may raise SL closer to current price.
+        t = self.rm.open_trade
+        if t and Config.USE_TRAILING_STOP:
+            new_sl = self.rm.update_trailing_stop(current_price)
+            if new_sl is not None and Config.USE_EXCHANGE_SL_TP and t.sl_order_id:
+                # Cancel the stale exchange SL and place a new one at the trailed price.
+                if self.exchange.cancel_order(t.sl_order_id):
+                    close_side   = "sell" if t.side == "long" else "buy"
+                    new_sl_order = self.exchange.place_stop_loss_order(
+                        close_side, t.contracts, new_sl
+                    )
+                    if new_sl_order:
+                        t.sl_order_id = str(new_sl_order.get("id", ""))
+                        log.info("Exchange SL trailed to %.4f", new_sl)
+                    else:
+                        log.warning("Failed to place trailed SL order — software SL active")
+
         exit_reason = self.rm.check_exit_conditions(current_price)
         if exit_reason is None:
-            t = self.rm.open_trade
             if t:
                 log.debug(
                     "Holding %s | entry=%.4f current=%.4f TP=%.4f SL=%.4f",

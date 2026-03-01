@@ -48,7 +48,7 @@ class Config:
 
     # ── Risk management ──────────────────────────────────────────────────────
     MAX_SESSION_LOSS_PCT:   float = _get("MAX_SESSION_LOSS_PCT",   default="30",   cast=float)
-    TAKE_PROFIT_PCT:        float = _get("TAKE_PROFIT_PCT",        default="0.7",  cast=float)
+    TAKE_PROFIT_PCT:        float = _get("TAKE_PROFIT_PCT",        default="1.0",  cast=float)
     STOP_LOSS_PCT:          float = _get("STOP_LOSS_PCT",          default="0.25", cast=float)
     MAX_CONCURRENT_TRADES:  int   = _get("MAX_CONCURRENT_TRADES",  default="1",    cast=int)
     TRADE_COOLDOWN_SECONDS: int   = _get("TRADE_COOLDOWN_SECONDS", default="30",   cast=int)
@@ -80,6 +80,29 @@ class Config:
     ATR_PERIOD:    int   = _get("ATR_PERIOD",    default="14",   cast=int)
     ATR_TP_MULT:   float = _get("ATR_TP_MULT",   default="6.0",  cast=float)
     ATR_SL_MULT:   float = _get("ATR_SL_MULT",   default="2.5",  cast=float)
+
+    # ── MACD momentum confirmation ────────────────────────────────────────────
+    # MACD histogram must agree with the EMA crossover direction before entry.
+    # LONG requires histogram > 0 (bullish momentum building).
+    # SHORT requires histogram < 0 (bearish momentum building).
+    # Also requires RSI to be rising (LONG) or falling (SHORT) — confirming
+    # that momentum has not yet exhausted at the moment of crossover.
+    MACD_FAST:   int = _get("MACD_FAST",   default="12", cast=int)
+    MACD_SLOW:   int = _get("MACD_SLOW",   default="26", cast=int)
+    MACD_SIGNAL: int = _get("MACD_SIGNAL", default="9",  cast=int)
+
+    # ── Trailing stop ─────────────────────────────────────────────────────────
+    # Once price moves TRAILING_STOP_TRIGGER_PCT of the TP distance in our
+    # favour, trail the stop-loss at TRAILING_STOP_DIST_PCT below the current
+    # price (LONG) or above it (SHORT).
+    # Converts many stop-outs into breakevens or small wins.
+    # Example: TP=0.7%, trigger=50% → activates after +0.35%; trail=0.15%.
+    USE_TRAILING_STOP:         bool  = _get("USE_TRAILING_STOP",         default="true").lower() == "true"
+    TRAILING_STOP_TRIGGER_PCT: float = _get("TRAILING_STOP_TRIGGER_PCT", default="0.5",  cast=float)
+    # Trail distance = TRIGGER × TP_PCT so SL lands at breakeven when trigger fires.
+    # Example: TP=0.70%, trigger=50% → trigger fires at +0.35%;
+    # dist=0.35% sets SL to entry (breakeven), then trails upward with price.
+    TRAILING_STOP_DIST_PCT:    float = _get("TRAILING_STOP_DIST_PCT",    default="0.35", cast=float)
 
     # ── EMA slope gate ────────────────────────────────────────────────────────
     # Fast EMA must be actively trending in the signal direction.
@@ -135,7 +158,8 @@ class Config:
     LOG_FILE:  str = _get("LOG_FILE",  default="logs/trading_bot.log")
 
     # Minimum candles needed before generating signals
-    MIN_CANDLES: int = max(EMA_SLOW, RSI_PERIOD) + 5
+    # MACD(12,26,9) needs at least MACD_SLOW + MACD_SIGNAL candles to warm up
+    MIN_CANDLES: int = max(EMA_SLOW, RSI_PERIOD, MACD_SLOW + MACD_SIGNAL) + 5
 
     # ── Startup validation ────────────────────────────────────────────────────
 

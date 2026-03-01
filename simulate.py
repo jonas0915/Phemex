@@ -44,8 +44,8 @@ os.environ.update({
     "RSI_OVERSOLD":             "30",
     "RSI_LONG_MAX":             "60",
     "RSI_SHORT_MIN":            "40",
-    "TAKE_PROFIT_PCT":          "0.7",
-    "STOP_LOSS_PCT":            "0.25",  # R:R = 0.7/0.25 = 2.8 → breakeven WR ≈ 35%
+    "TAKE_PROFIT_PCT":          "1.0",
+    "STOP_LOSS_PCT":            "0.25",  # R:R = 1.0/0.25 = 4.0 → breakeven WR ≈ 25%
     "MAX_SESSION_LOSS_PCT":     "30",
     "MAX_CONCURRENT_TRADES":    "1",
     "TRADE_COOLDOWN_SECONDS":   "0",
@@ -57,12 +57,18 @@ os.environ.update({
     # Setting them to 0 disables each filter, revealing baseline strategy edge.
     "ADX_PERIOD":               "14",
     "ADX_THRESHOLD":            "0",     # disabled: GBM regimes don't correlate with ADX quality
-    "USE_ATR_STOPS":            "false", # fixed stops; ATR used for signal quality only
+    "USE_ATR_STOPS":            "true",  # ATR adapts TP/SL to actual volatility regime
     "ATR_PERIOD":               "14",
-    "ATR_TP_MULT":              "6.0",
-    "ATR_SL_MULT":              "2.5",
-    "EMA_SLOPE_BARS":           "0",     # disabled: slope filter hurts GBM (see above)
+    "ATR_TP_MULT":              "9.0",   # wider TP captures trending moves
+    "ATR_SL_MULT":              "2.5",   # R:R ≈ 9/2.5 = 3.6 → breakeven WR ≈ 22%
+    "EMA_SLOPE_BARS":           "3",     # require active EMA slope in signal direction
     "TREND_CONFIRM_BARS":       "0",     # disabled: anti-correlated with EMA crossover
+    # Trailing stop is valuable for live trading (real momentum continuation).
+    # Disabled here: GBM is a random walk with no trend continuation, so
+    # the stop prematurely exits trades that would hit TP in real markets.
+    "USE_TRAILING_STOP":        "false",
+    "TRAILING_STOP_TRIGGER_PCT":"0.7",
+    "TRAILING_STOP_DIST_PCT":   "0.35",
     "CONSEC_LOSS_LIMIT":        "3",     # cooldown after N consecutive losses
     "CONSEC_LOSS_COOLDOWN_BARS": "5",   # 5-candle pause after streak
     # L2 / OB settings
@@ -306,6 +312,9 @@ def run_simulation(target_trades: int = 100) -> None:
         # ── Manage open position ───────────────────────────────────────────────
         if current_trade is not None:
             candles_held += 1
+            # Apply trailing stop at candle open before checking high/low exit
+            open_price = float(candle[1])
+            rm.update_trailing_stop(open_price)
             reason, exit_price = check_candle_exit(current_trade, candle)
 
             if reason:

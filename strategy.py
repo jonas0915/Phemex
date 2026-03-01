@@ -77,6 +77,7 @@ class StrategyResult:
     spread_pct:    float = 0.0
     adx:           float = 0.0   # trend strength (0–100)
     atr_pct:       float = 0.0   # ATR as fraction of price
+    macd_hist:     float = 0.0   # MACD histogram (+ bullish, − bearish)
 
 
 # ── Indicator helpers ──────────────────────────────────────────────────────────
@@ -110,6 +111,25 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (low  - prev).abs(),
     ], axis=1).max(axis=1)
     return tr.ewm(com=period - 1, adjust=False).mean()
+
+
+def _macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    MACD line, signal line, and histogram.
+    Histogram > 0 means bullish momentum; < 0 means bearish momentum.
+    Rising histogram means momentum is accelerating in that direction.
+    """
+    ema_f    = series.ewm(span=fast,   adjust=False).mean()
+    ema_s    = series.ewm(span=slow,   adjust=False).mean()
+    macd_ln  = ema_f - ema_s
+    sig_ln   = macd_ln.ewm(span=signal, adjust=False).mean()
+    hist     = macd_ln - sig_ln
+    return macd_ln, sig_ln, hist
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -267,6 +287,12 @@ class ScalpStrategy:
         df["vwap"]     = _vwap(df)
         df["atr"]      = _atr(df, Config.ATR_PERIOD)
         df["adx"]      = _adx(df, Config.ADX_PERIOD)
+        _, _, df["macd_hist"] = _macd(
+            df["close"],
+            fast=Config.MACD_FAST,
+            slow=Config.MACD_SLOW,
+            signal=Config.MACD_SIGNAL,
+        )
 
         prev = df.iloc[-2]
         curr = df.iloc[-1]
@@ -276,15 +302,17 @@ class ScalpStrategy:
         ema_fast_prev = float(prev["ema_fast"])
         ema_slow_prev = float(prev["ema_slow"])
         rsi           = float(curr["rsi"])
+        rsi_prev      = float(prev["rsi"])
         price         = float(curr["close"])
         vwap          = float(curr["vwap"])
         adx_val       = float(curr["adx"])
         atr_val       = float(curr["atr"])
         atr_pct       = atr_val / price if price > 0 else 0.0
+        macd_hist     = float(curr["macd_hist"])
 
         if any(math.isnan(v) for v in (
             ema_fast_curr, ema_slow_curr, ema_fast_prev, ema_slow_prev,
-            rsi, vwap, adx_val, atr_val,
+            rsi, vwap, adx_val, atr_val, macd_hist,
         )):
             log.warning("NaN indicator on candle %d — skipping signal", len(ohlcv))
             return StrategyResult(
@@ -377,21 +405,25 @@ class ScalpStrategy:
             trend_ok  = med_trend_up                # medium-term bias confirmed
             vwap_ok   = (not Config.USE_VWAP_FILTER) or (price >= vwap * 0.999)
             ob_ok     = (not orderbook) or (ob_ctx.imbalance >= Config.OB_IMBALANCE_THRESHOLD)
+            # MACD histogram must be positive: confirms bullish momentum aligns
+            macd_ok   = macd_hist > 0
+            # RSI must be rising: momentum is building, not exhausted
+            rsi_ok    = rsi > rsi_prev
 
-            if slope_ok_long and trend_ok and vwap_ok and ob_ok:
+            if slope_ok_long and trend_ok and vwap_ok and ob_ok and macd_ok and rsi_ok:
                 signal = Signal.LONG
                 tp     = price * (1 + tp_pct)
                 sl     = price * (1 - sl_pct)
                 log.info(
                     "LONG signal | price=%.4f TP=%.4f (+%.3f%%) SL=%.4f (-%.3f%%) "
-                    "ADX=%.1f ATR=%.4f%% RSI=%.2f",
+                    "ADX=%.1f ATR=%.4f%% RSI=%.2f MACD_h=%.4f",
                     price, tp, tp_pct * 100, sl, sl_pct * 100,
-                    adx_val, atr_pct * 100, rsi,
+                    adx_val, atr_pct * 100, rsi, macd_hist,
                 )
             else:
                 log.debug(
-                    "LONG cross BLOCKED | slope_ok_long=%s trend_ok=%s vwap_ok=%s ob_ok=%s",
-                    slope_ok_long, trend_ok, vwap_ok, ob_ok,
+                    "LONG cross BLOCKED | slope=%s trend=%s vwap=%s ob=%s macd=%s rsi_up=%s",
+                    slope_ok_long, trend_ok, vwap_ok, ob_ok, macd_ok, rsi_ok,
                 )
 
         # ── 8. SHORT signal ────────────────────────────────────────────────────
@@ -399,21 +431,25 @@ class ScalpStrategy:
             trend_ok  = med_trend_down              # medium-term bias confirmed
             vwap_ok   = (not Config.USE_VWAP_FILTER) or (price <= vwap * 1.001)
             ob_ok     = (not orderbook) or (ob_ctx.imbalance <= -Config.OB_IMBALANCE_THRESHOLD)
+            # MACD histogram must be negative: confirms bearish momentum aligns
+            macd_ok   = macd_hist < 0
+            # RSI must be falling: momentum is building on the downside
+            rsi_ok    = rsi < rsi_prev
 
-            if slope_ok_short and trend_ok and vwap_ok and ob_ok:
+            if slope_ok_short and trend_ok and vwap_ok and ob_ok and macd_ok and rsi_ok:
                 signal = Signal.SHORT
                 tp     = price * (1 - tp_pct)
                 sl     = price * (1 + sl_pct)
                 log.info(
                     "SHORT signal | price=%.4f TP=%.4f (-%.3f%%) SL=%.4f (+%.3f%%) "
-                    "ADX=%.1f ATR=%.4f%% RSI=%.2f",
+                    "ADX=%.1f ATR=%.4f%% RSI=%.2f MACD_h=%.4f",
                     price, tp, tp_pct * 100, sl, sl_pct * 100,
-                    adx_val, atr_pct * 100, rsi,
+                    adx_val, atr_pct * 100, rsi, macd_hist,
                 )
             else:
                 log.debug(
-                    "SHORT cross BLOCKED | slope_ok_short=%s trend_ok=%s vwap_ok=%s ob_ok=%s",
-                    slope_ok_short, trend_ok, vwap_ok, ob_ok,
+                    "SHORT cross BLOCKED | slope=%s trend=%s vwap=%s ob=%s macd=%s rsi_dn=%s",
+                    slope_ok_short, trend_ok, vwap_ok, ob_ok, macd_ok, rsi_ok,
                 )
 
         return StrategyResult(
@@ -429,4 +465,5 @@ class ScalpStrategy:
             spread_pct    = ob_ctx.spread_pct,
             adx           = adx_val,
             atr_pct       = atr_pct,
+            macd_hist     = macd_hist,
         )
