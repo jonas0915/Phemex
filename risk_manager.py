@@ -125,6 +125,12 @@ class RiskManager:
 
     def register_open(self, trade: OpenTrade) -> None:
         """Call immediately after an order is filled."""
+        if self._open_trade is not None:
+            log.error(
+                "register_open called while trade %s is already open — ignoring new trade %s",
+                self._open_trade.trade_id, trade.trade_id,
+            )
+            return
         self._open_trade = trade
         log.info(
             "Trade opened | id=%s side=%s entry=%.4f contracts=%.6f TP=%.4f SL=%.4f",

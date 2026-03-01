@@ -105,6 +105,15 @@ class ScalpStrategy:
         bullish_cross = (ema_fast_prev <= ema_slow_prev) and (ema_fast_curr > ema_slow_curr)
         bearish_cross = (ema_fast_prev >= ema_slow_prev) and (ema_fast_curr < ema_slow_curr)
 
+        # Guard against NaN indicators (e.g. flat price series, zero volume)
+        import math
+        if any(math.isnan(v) for v in (ema_fast_curr, ema_slow_curr,
+                                        ema_fast_prev, ema_slow_prev, float(rsi))):
+            log.warning("NaN indicator on candle %d — skipping signal", len(ohlcv))
+            return StrategyResult(signal=Signal.NONE, current_price=float(price),
+                                  ema_fast=0.0, ema_slow=0.0, rsi=0.0,
+                                  take_profit=0.0, stop_loss=0.0)
+
         log.debug(
             "EMA fast=%.4f slow=%.4f | RSI=%.2f | bull_x=%s bear_x=%s | price=%.4f",
             ema_fast_curr, ema_slow_curr, rsi, bullish_cross, bearish_cross, price,

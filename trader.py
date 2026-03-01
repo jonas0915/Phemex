@@ -114,13 +114,24 @@ class Trader:
 
         fill_price = float(order.get("average") or order.get("price") or current_price)
 
+        # Recompute TP/SL from actual fill price to account for slippage.
+        # Using the signal-candle price would make the levels wrong after any slip.
+        tp_pct = Config.TAKE_PROFIT_PCT / 100
+        sl_pct = Config.STOP_LOSS_PCT / 100
+        if result.signal == Signal.LONG:
+            take_profit = fill_price * (1 + tp_pct)
+            stop_loss   = fill_price * (1 - sl_pct)
+        else:
+            take_profit = fill_price * (1 - tp_pct)
+            stop_loss   = fill_price * (1 + sl_pct)
+
         open_trade = OpenTrade(
             trade_id=str(order.get("id") or uuid.uuid4()),
             side=result.signal.value,
             entry_price=fill_price,
             contracts=qty,
-            take_profit=result.take_profit,
-            stop_loss=result.stop_loss,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
         )
         self.rm.register_open(open_trade)
 
@@ -161,6 +172,14 @@ class Trader:
                 for pos in positions:
                     self.exchange.close_position(pos)
 
-            ticker = self.exchange.fetch_ticker()
-            price = float(ticker.get("last", 0))
+            # Fetch last price for PnL accounting; fall back to entry price
+            # if the ticker call fails so we never record a close at price 0.
+            try:
+                ticker = self.exchange.fetch_ticker()
+                price = float(ticker.get("last") or 0)
+                if price <= 0:
+                    raise ValueError("ticker returned zero/null price")
+            except Exception as exc:  # noqa: BLE001
+                price = self.rm.open_trade.entry_price
+                log.warning("Ticker failed during emergency close (%s) — using entry price %.4f", exc, price)
             self.rm.register_close(price, "manual")

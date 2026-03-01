@@ -48,10 +48,17 @@ class PhemexExchange:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _call(self, fn, *args, **kwargs):
-        """Call a ccxt method with automatic retry on network errors."""
+        """Call a ccxt method with automatic retry on network/rate-limit errors."""
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
                 return fn(*args, **kwargs)
+            except ccxt.RateLimitExceeded as exc:
+                if attempt == self._MAX_RETRIES:
+                    raise
+                wait = self._RETRY_DELAY * attempt * 2   # longer back-off for rate limits
+                log.warning("Rate limit (attempt %d/%d) — sleeping %ds: %s",
+                            attempt, self._MAX_RETRIES, wait, exc)
+                time.sleep(wait)
             except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
                 if attempt == self._MAX_RETRIES:
                     raise
@@ -76,12 +83,16 @@ class PhemexExchange:
 
     def fetch_ohlcv(self, limit: int = 100) -> list[list]:
         """Return OHLCV candles [[ts, o, h, l, c, v], ...]."""
-        return self._call(
+        result = self._call(
             self._exchange.fetch_ohlcv,
             Config.SYMBOL,
             timeframe=Config.TIMEFRAME,
             limit=limit,
         )
+        if not result:
+            log.warning("fetch_ohlcv returned empty or None for %s", Config.SYMBOL)
+            return []
+        return result
 
     def fetch_ticker(self) -> dict:
         return self._call(self._exchange.fetch_ticker, Config.SYMBOL)
@@ -93,11 +104,34 @@ class PhemexExchange:
     def fetch_usdt_balance(self) -> float:
         """Return total USDT equity (including unrealised PnL)."""
         bal = self.fetch_balance()
-        # Phemex futures accounts use 'USDT' as the settle currency
-        usdt = bal.get("USDT") or bal.get("total", {})
-        if isinstance(usdt, dict):
-            return float(usdt.get("total", 0))
-        return float(usdt)
+        # Walk through common CCXT balance structures for Phemex futures
+        for currency in ("USDT", "USD"):
+            entry = bal.get(currency)
+            if isinstance(entry, dict):
+                for field in ("total", "free", "used"):
+                    val = entry.get(field)
+                    if val is not None:
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            pass
+            elif entry is not None:
+                try:
+                    return float(entry)
+                except (ValueError, TypeError):
+                    pass
+        # Last resort: walk bal["total"] sub-dict
+        total_dict = bal.get("total") or {}
+        if isinstance(total_dict, dict):
+            for currency in ("USDT", "USD"):
+                val = total_dict.get(currency)
+                if val is not None:
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+        log.warning("Could not parse USDT balance from exchange response")
+        return 0.0
 
     def fetch_positions(self) -> list[dict]:
         """Return open positions for the configured symbol."""
@@ -124,6 +158,9 @@ class PhemexExchange:
             side:   'buy' or 'sell'
             amount: contract size (USDT notional / price → qty)
         """
+        if amount <= 0:
+            log.error("Refused market order — qty must be > 0, got %.6f", amount)
+            return None
         try:
             order = self._call(
                 self._exchange.create_market_order,
@@ -170,13 +207,26 @@ class PhemexExchange:
     def close_position(self, position: dict) -> Optional[dict]:
         """
         Immediately close an open position with a market order.
+        Handles the various side-field names CCXT may use for Phemex.
         """
-        side = position.get("side", "")          # 'long' or 'short'
-        contracts = float(position.get("contracts", 0))
+        contracts = float(position.get("contracts", 0) or 0)
         if contracts == 0:
             return None
 
-        close_side = "sell" if side == "long" else "buy"
+        # CCXT normalises side to 'long'/'short'; fallback to info dict
+        side = (position.get("side") or "").lower()
+        if side not in ("long", "short"):
+            info = position.get("info", {})
+            side = (info.get("side") or info.get("posSide") or "").lower()
+
+        if side == "long":
+            close_side = "sell"
+        elif side == "short":
+            close_side = "buy"
+        else:
+            log.error("Cannot determine position side from: %s — skipping close", position)
+            return None
+
         log.info("Closing %s position | contracts=%.6f", side, contracts)
         return self.place_market_order(close_side, contracts)
 

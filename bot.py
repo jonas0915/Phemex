@@ -48,19 +48,49 @@ def main() -> None:
     log.info("Symbol      : %s", Config.SYMBOL)
     log.info("Timeframe   : %s", Config.TIMEFRAME)
     log.info("Leverage    : %dx", Config.LEVERAGE)
-    log.info("Trade size  : %.2f USDT", Config.TRADE_SIZE_USDT)
+    if Config.RISK_PER_TRADE_PCT > 0:
+        log.info("Sizing      : compound %.1f%% of balance × %dx leverage",
+                 Config.RISK_PER_TRADE_PCT, Config.LEVERAGE)
+    else:
+        log.info("Sizing      : fixed %.2f USDT × %dx = %.2f USDT notional",
+                 Config.TRADE_SIZE_USDT, Config.LEVERAGE,
+                 Config.TRADE_SIZE_USDT * Config.LEVERAGE)
     log.info("Max loss    : %.1f%%", Config.MAX_SESSION_LOSS_PCT)
     log.info("Testnet     : %s", Config.TESTNET)
     log.info("=" * 60)
 
     # ── Bootstrap ────────────────────────────────────────────────────────────
-    exchange = PhemexExchange()
+    try:
+        exchange = PhemexExchange()
+    except Exception as exc:
+        log.error("Failed to initialise exchange connection: %s", exc)
+        sys.exit(1)
 
-    starting_balance = exchange.fetch_usdt_balance()
+    try:
+        starting_balance = exchange.fetch_usdt_balance()
+    except Exception as exc:
+        log.error("Failed to fetch starting balance: %s", exc)
+        sys.exit(1)
+
     log.info("Session starting balance: %.4f USDT", starting_balance)
     if starting_balance <= 0:
-        log.error("Balance is zero or could not be fetched — check API credentials and testnet setting.")
+        log.error("Balance is zero — check API credentials and testnet setting.")
         sys.exit(1)
+
+    # ── Startup position reconciliation ──────────────────────────────────────
+    # If the bot crashed while a position was open, close it cleanly before
+    # starting a new session so we never hold a ghost position.
+    try:
+        orphan_positions = exchange.fetch_positions()
+        if orphan_positions:
+            log.warning(
+                "Found %d open position(s) from a previous session — closing before start",
+                len(orphan_positions),
+            )
+            for pos in orphan_positions:
+                exchange.close_position(pos)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not check for orphan positions: %s", exc)
 
     risk_manager = RiskManager(starting_balance)
     strategy = ScalpStrategy()
@@ -99,7 +129,10 @@ def main() -> None:
             elapsed = time.time() - loop_start
             sleep_for = max(0, tick_interval - elapsed)
             log.debug("Tick done in %.2fs — sleeping %.2fs", elapsed, sleep_for)
-            time.sleep(sleep_for)
+            # Sleep in 1-second increments so SIGTERM is handled promptly
+            deadline = time.time() + sleep_for
+            while time.time() < deadline and not shutdown_requested:
+                time.sleep(min(1.0, deadline - time.time()))
 
     finally:
         log.info("Shutting down — closing all open positions...")
