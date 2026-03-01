@@ -127,13 +127,27 @@ def main() -> None:
 
     # ── Main loop ────────────────────────────────────────────────────────────
     try:
+        consecutive_errors = 0
         while not shutdown_requested:
             loop_start = time.time()
 
             try:
                 trader.tick()
+                consecutive_errors = 0
             except Exception as exc:  # noqa: BLE001
                 log.exception("Unhandled error in tick: %s", exc)
+                consecutive_errors += 1
+                # H4: exponential backoff after repeated failures so we don't
+                # hammer the API when it's down (30s, 60s, 120s, … up to 5min).
+                if consecutive_errors >= 3:
+                    backoff = min(30 * 2 ** (consecutive_errors - 3), 300)
+                    log.warning(
+                        "%d consecutive tick errors — backing off %ds before next tick",
+                        consecutive_errors, backoff,
+                    )
+                    deadline = time.time() + backoff
+                    while time.time() < deadline and not shutdown_requested:
+                        time.sleep(min(1.0, deadline - time.time()))
 
             # Check session locked (might have been set inside tick)
             if risk_manager.session_locked:

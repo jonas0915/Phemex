@@ -128,7 +128,7 @@ class Config:
     USE_MAKER_ENTRY: bool = _get("USE_MAKER_ENTRY", default="true").lower() == "true"
 
     # Seconds to wait for limit fill before cancelling and using market order.
-    MAKER_ENTRY_TIMEOUT_S: int = _get("MAKER_ENTRY_TIMEOUT_S", default="10", cast=int)
+    MAKER_ENTRY_TIMEOUT_S: int = _get("MAKER_ENTRY_TIMEOUT_S", default="3", cast=int)
 
     # ── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = _get("LOG_LEVEL", default="INFO")

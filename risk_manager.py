@@ -47,6 +47,7 @@ class OpenTrade:
     opened_at:   float = field(default_factory=time.time)
     sl_order_id: str   = ""   # exchange-native SL order ID (empty = software-only)
     tp_order_id: str   = ""   # exchange-native TP order ID (empty = software-only)
+    maker_entry: bool  = True  # True if filled via maker limit; False if via taker market
 
 
 class RiskManager:
@@ -196,9 +197,11 @@ class RiskManager:
             pnl = (t.entry_price - exit_price) * t.contracts
 
         # Fees: maker entry earns a -0.025% rebate; exit is always taker at +0.075%.
-        # Taker-taker (no maker entry): 0.075% + 0.075% = 0.15% round trip.
-        # Maker-taker (USE_MAKER_ENTRY): -0.025% + 0.075% = 0.05% round trip.
-        if Config.USE_MAKER_ENTRY:
+        # Use t.maker_entry (not Config.USE_MAKER_ENTRY) so limit orders that timed
+        # out and fell back to market are charged the correct taker fee on both sides.
+        # Maker-taker: -0.025% entry rebate + 0.075% exit fee = 0.05% round trip.
+        # Taker-taker: 0.075% + 0.075% = 0.15% round trip.
+        if t.maker_entry:
             fee = exit_price * t.contracts * 0.00075 - t.entry_price * t.contracts * 0.00025
         else:
             fee = (t.entry_price + exit_price) * t.contracts * 0.00075

@@ -121,12 +121,44 @@ class Trader:
             return
 
         if positions:
-            return  # Position still open on exchange — nothing to reconcile
+            # H2: verify position size matches what we expect (partial liquidation check)
+            actual_contracts = float(positions[0].get("contracts", 0) or 0)
+            if actual_contracts > 0 and abs(actual_contracts - t.contracts) / t.contracts > 0.01:
+                log.warning(
+                    "Position size mismatch for trade %s: expected %.6f contracts, "
+                    "exchange shows %.6f — possible partial liquidation",
+                    t.trade_id, t.contracts, actual_contracts,
+                )
+            return  # Position still open — nothing to reconcile
+
+        # C1: try to get the actual fill price from exchange order history instead
+        # of using the stale ticker price, which may be far from the real close.
+        actual_close_price = current_price
+        try:
+            closed_orders = self.exchange.fetch_closed_orders(limit=5)
+            known_ids = {t.sl_order_id, t.tp_order_id} - {""}
+            for o in reversed(closed_orders):
+                if o.get("status") != "closed":
+                    continue
+                avg = float(o.get("average") or 0)
+                if avg <= 0:
+                    continue
+                # Prefer the order whose ID we recognise as our SL/TP
+                if known_ids and str(o.get("id")) in known_ids:
+                    actual_close_price = avg
+                    break
+                # Fallback: most recent closed order placed after this trade opened
+                filled_ts = o.get("timestamp") or 0
+                if filled_ts >= t.opened_at * 1000:
+                    actual_close_price = avg
+                    break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not fetch closed orders for actual fill price: %s", exc)
 
         log.warning(
             "Position sync: exchange shows no open position for trade %s "
-            "— recording close at current price %.4f (native SL/TP or manual).",
-            t.trade_id, current_price,
+            "— recording close at %.4f (native SL/TP or manual).",
+            t.trade_id, actual_close_price,
         )
 
         for order_id, label in ((t.sl_order_id, "SL"), (t.tp_order_id, "TP")):
@@ -136,7 +168,7 @@ class Trader:
                 except Exception as exc:  # noqa: BLE001
                     log.debug("Could not cancel stale %s order %s: %s", label, order_id, exc)
 
-        self.rm.register_close(current_price, "exchange_closed")
+        self.rm.register_close(actual_close_price, "exchange_closed")
 
     # ── Trade management ──────────────────────────────────────────────────────
 
@@ -169,14 +201,20 @@ class Trader:
             qty = self.exchange.calculate_order_qty(current_price)
 
         # ── Smart execution: try maker limit first, fall back to market ─────────
+        # H1: track whether entry actually filled as maker (limit) or taker (market)
+        # so register_close() applies the correct fee formula.
+        was_maker_fill = False
         if Config.USE_MAKER_ENTRY and orderbook:
-            order = self._try_maker_entry(side, qty, orderbook, result.signal)
+            result_pair = self._try_maker_entry(side, qty, orderbook, result.signal)
+            if result_pair is None:
+                log.error("Order placement failed — trade aborted")
+                return
+            order, was_maker_fill = result_pair
         else:
             order = self.exchange.place_market_order(side, qty)
-
-        if order is None:
-            log.error("Order placement failed — trade aborted")
-            return
+            if order is None:
+                log.error("Order placement failed — trade aborted")
+                return
 
         fill_price = float(order.get("average") or order.get("price") or current_price)
 
@@ -199,6 +237,7 @@ class Trader:
             contracts   = qty,
             take_profit = take_profit,
             stop_loss   = stop_loss,
+            maker_entry = was_maker_fill,
         )
         self.rm.register_open(open_trade)
 
@@ -206,20 +245,36 @@ class Trader:
         if Config.USE_EXCHANGE_SL_TP:
             close_side = "sell" if result.signal == Signal.LONG else "buy"
 
-            sl_order = self.exchange.place_stop_loss_order(close_side, qty, stop_loss)
+            # C3: SL is critical — retry up to 2 more times before giving up.
+            # If all attempts fail, close the position immediately so we are never
+            # holding an unprotected leveraged trade.
+            sl_order = None
+            for attempt in range(3):
+                sl_order = self.exchange.place_stop_loss_order(close_side, qty, stop_loss)
+                if sl_order:
+                    break
+                if attempt < 2:
+                    log.warning(
+                        "SL placement failed (attempt %d/3) — retrying in 0.5s", attempt + 1
+                    )
+                    time.sleep(0.5)
+
+            if not sl_order:
+                log.error(
+                    "Exchange-native SL failed after 3 attempts — closing position "
+                    "immediately to avoid holding an unprotected leveraged trade."
+                )
+                self._close_position(fill_price, "sl_placement_failed")
+                return
+
             tp_order = self.exchange.place_take_profit_order(close_side, qty, take_profit)
 
-            sl_id = str(sl_order.get("id", "")) if sl_order else ""
+            sl_id = str(sl_order.get("id", ""))
             tp_id = str(tp_order.get("id", "")) if tp_order else ""
 
             if sl_id or tp_id:
                 self.rm.set_order_ids(sl_id, tp_id)
 
-            if not sl_order:
-                log.warning(
-                    "Exchange-native SL not placed — position protected by software SL only. "
-                    "A bot crash would leave this position unprotected."
-                )
             if not tp_order:
                 log.warning("Exchange-native TP not placed — relying on software TP only.")
 
@@ -229,40 +284,45 @@ class Trader:
         qty: float,
         orderbook: dict,
         signal: Signal,
-    ) -> Optional[dict]:
+    ) -> Optional[tuple[dict, bool]]:
         """
         Attempt entry with a limit order posted inside the spread.
 
         Phemex pays a maker rebate of −0.025% vs a taker fee of +0.075%.
-        Saving 0.10% per fill has a real impact against a 0.6% TP target.
+        Saving 0.10% per fill has a real impact against a 0.7% TP target.
 
         Strategy:
           • LONG  → limit at (best_bid + mid) / 2  (slightly above best bid)
           • SHORT → limit at (best_ask + mid) / 2  (slightly below best ask)
 
-        If not filled within MAKER_ENTRY_TIMEOUT_S seconds, the limit order
-        is cancelled and we fall back to a market order.
+        Returns (order_dict, was_maker_fill). was_maker_fill=True means the
+        limit actually filled (maker rebate applies); False means a market
+        order was used (taker fees apply on both entry and exit).
+        Returns None if all order placement attempts failed.
         """
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
 
         if not bids or not asks:
-            return self.exchange.place_market_order(side, qty)
+            mkt = self.exchange.place_market_order(side, qty)
+            return (mkt, False) if mkt else None
 
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
         mid      = (best_bid + best_ask) / 2
 
+        # H3: use market's actual price precision instead of hardcoded 1 decimal
+        price_precision = self.exchange.get_price_precision()
         if signal == Signal.LONG:
-            # Place between best bid and mid — post as maker, slight pull toward mid
-            limit_price = round((best_bid + mid) / 2, 1)
+            limit_price = round((best_bid + mid) / 2, price_precision)
         else:
-            limit_price = round((best_ask + mid) / 2, 1)
+            limit_price = round((best_ask + mid) / 2, price_precision)
 
         order = self.exchange.place_limit_order(side, qty, limit_price)
         if order is None:
             log.debug("Limit order placement failed — falling back to market")
-            return self.exchange.place_market_order(side, qty)
+            mkt = self.exchange.place_market_order(side, qty)
+            return (mkt, False) if mkt else None
 
         order_id = str(order.get("id", ""))
         log.info(
@@ -271,9 +331,12 @@ class Trader:
             side, qty, limit_price, order_id, Config.MAKER_ENTRY_TIMEOUT_S,
         )
 
+        # C2: poll with 0.5s intervals (was 1s) to detect fills sooner.
+        # MAKER_ENTRY_TIMEOUT_S default is now 3s (was 10s) to avoid blocking
+        # the main loop for extended periods.
         deadline = time.time() + Config.MAKER_ENTRY_TIMEOUT_S
         while time.time() < deadline:
-            time.sleep(1)
+            time.sleep(0.5)
             status = self.exchange.fetch_order_status(order_id)
             if status is None:
                 break
@@ -283,20 +346,20 @@ class Trader:
                     "Maker limit filled | id=%s avg=%.4f",
                     order_id, status.get("average", limit_price),
                 )
-                return status
+                return (status, True)
             if order_status in ("canceled", "rejected", "expired"):
-                log.warning(
-                    "Maker limit %s — falling back to market", order_status
-                )
-                return self.exchange.place_market_order(side, qty)
+                log.warning("Maker limit %s — falling back to market", order_status)
+                mkt = self.exchange.place_market_order(side, qty)
+                return (mkt, False) if mkt else None
 
-        # Timed out — cancel the pending limit and use market
+        # Timed out — cancel the pending limit and fall back to market
         log.info(
             "Maker limit not filled in %ds — cancelling, using market",
             Config.MAKER_ENTRY_TIMEOUT_S,
         )
         self.exchange.cancel_order(order_id)
-        return self.exchange.place_market_order(side, qty)
+        mkt = self.exchange.place_market_order(side, qty)
+        return (mkt, False) if mkt else None
 
     def _manage_open_trade(self, current_price: float) -> None:
         """Software TP/SL safety net — fires if native orders haven't triggered."""
@@ -329,14 +392,23 @@ class Trader:
                 except Exception as exc:  # noqa: BLE001
                     log.debug("Could not cancel %s order %s: %s", label, order_id, exc)
 
+        close_order = None
         positions = self.exchange.fetch_positions()
         if positions:
-            self.exchange.close_position(positions[0])
+            close_order = self.exchange.close_position(positions[0])
         else:
             close_side = "sell" if t.side == "long" else "buy"
-            self.exchange.place_market_order(close_side, t.contracts)
+            close_order = self.exchange.place_market_order(close_side, t.contracts)
 
-        self.rm.register_close(current_price, reason)
+        # H5: use the actual fill price from the close order rather than the
+        # stale ticker price passed in, which may differ by 0.02–0.08% (slippage).
+        actual_close_price = current_price
+        if close_order:
+            avg = float(close_order.get("average") or 0)
+            if avg > 0:
+                actual_close_price = avg
+
+        self.rm.register_close(actual_close_price, reason)
 
     def emergency_close_all(self) -> None:
         """Force-close everything — called on bot shutdown or max-loss breach."""

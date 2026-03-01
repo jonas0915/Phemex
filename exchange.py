@@ -169,6 +169,31 @@ class PhemexExchange:
     def fetch_open_orders(self) -> list[dict]:
         return self._call(self._exchange.fetch_open_orders, Config.SYMBOL)
 
+    def fetch_closed_orders(self, limit: int = 5) -> list[dict]:
+        """Return the most recent closed orders for the configured symbol."""
+        try:
+            return self._call(
+                self._exchange.fetch_closed_orders,
+                Config.SYMBOL,
+                limit=limit,
+            ) or []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_closed_orders failed: %s", exc)
+            return []
+
+    def get_price_precision(self) -> int:
+        """Return the number of decimal places for prices on the configured market."""
+        try:
+            import math
+            market = self._exchange.market(Config.SYMBOL)
+            precision = market.get("precision", {}).get("price", 1)
+            if isinstance(precision, float) and precision > 0:
+                # Some exchanges return tick size (e.g. 0.1) instead of decimal count
+                precision = max(0, -int(math.floor(math.log10(precision))))
+            return int(precision) if isinstance(precision, (int, float)) else 1
+        except Exception:  # noqa: BLE001
+            return 1
+
     # ── Order management ──────────────────────────────────────────────────────
 
     def place_market_order(self, side: str, amount: float) -> Optional[dict]:
