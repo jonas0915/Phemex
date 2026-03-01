@@ -1,12 +1,12 @@
 """
-simulate.py — Multi-trade offline simulation using synthetic BTC price data.
-Exercises ScalpStrategy + RiskManager with intra-candle TP/SL detection.
+simulate.py — Realistic multi-trade offline simulation using synthetic BTC price data.
+Uses Geometric Brownian Motion with regime switching, slippage, and funding costs.
 No API keys required.
 
 Usage:
-    python simulate.py                    # 100 trades, optimistic mode
-    python simulate.py 50                 # custom trade count, optimistic
-    python simulate.py 100 --realistic    # realistic GBM data + slippage + funding
+    python simulate.py                # 100 trades, 10x leverage
+    python simulate.py 50             # 50 trades, 10x leverage
+    python simulate.py 100 25         # 100 trades, 25x leverage
 """
 
 from __future__ import annotations
@@ -21,32 +21,12 @@ import numpy as np
 
 # ── Parse args before importing bot modules ────────────────────────────────
 parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("trades",      nargs="?", type=int, default=100)
-parser.add_argument("--realistic", action="store_true",
-                    help="Use real-world GBM data, slippage, and funding rates")
+parser.add_argument("trades",   nargs="?", type=int, default=100)
+parser.add_argument("leverage", nargs="?", type=int, default=10)
 _args = parser.parse_args()
 
-# ── Settings: optimistic (original) vs realistic ───────────────────────────
-if _args.realistic:
-    _ENV = {
-        "LEVERAGE":               "10",   # conservative
-        "TRADE_SIZE_USDT":        "10",   # $10 fixed per trade on a $100 account
-        "RISK_PER_TRADE_PCT":     "0",    # no compounding — fixed size only
-        "TAKE_PROFIT_PCT":        "0.6",
-        "STOP_LOSS_PCT":          "0.35",
-        "TRADE_COOLDOWN_SECONDS": "0",
-        "USE_VWAP_FILTER":        "false", # simulation can't model VWAP well; live bot uses it
-    }
-else:
-    _ENV = {
-        "LEVERAGE":               "25",
-        "TRADE_SIZE_USDT":        "200",
-        "RISK_PER_TRADE_PCT":     "20",
-        "TAKE_PROFIT_PCT":        "0.6",
-        "STOP_LOSS_PCT":          "0.35",
-        "TRADE_COOLDOWN_SECONDS": "0",
-        "USE_VWAP_FILTER":        "false", # optimistic mode: no filters
-    }
+if _args.leverage < 1 or _args.leverage > 100:
+    sys.exit(f"Error: leverage must be between 1 and 100 (got {_args.leverage})")
 
 os.environ.update({
     "PHEMEX_API_KEY":           "SIM_KEY",
@@ -54,6 +34,9 @@ os.environ.update({
     "PHEMEX_TESTNET":           "true",
     "TRADING_SYMBOL":           "BTC/USDT:USDT",
     "TRADING_TIMEFRAME":        "1m",
+    "LEVERAGE":                 str(_args.leverage),
+    "TRADE_SIZE_USDT":          "10",    # $10 fixed per trade on a $100 account
+    "RISK_PER_TRADE_PCT":       "0",     # no compounding — fixed size only
     "EMA_FAST":                 "9",
     "EMA_SLOW":                 "21",
     "RSI_PERIOD":               "14",
@@ -61,18 +44,20 @@ os.environ.update({
     "RSI_OVERSOLD":             "30",
     "RSI_LONG_MAX":             "60",
     "RSI_SHORT_MIN":            "40",
+    "TAKE_PROFIT_PCT":          "0.6",
+    "STOP_LOSS_PCT":            "0.35",
     "MAX_SESSION_LOSS_PCT":     "30",
     "MAX_CONCURRENT_TRADES":    "1",
+    "TRADE_COOLDOWN_SECONDS":   "0",
     "LOG_LEVEL":                "WARNING",
     "LOG_FILE":                 "logs/sim.log",
-    # L2 / OB settings — always enabled; thresholds match defaults
+    # L2 / OB settings — thresholds match defaults
     "OB_DEPTH":                 "20",
     "OB_IMBALANCE_THRESHOLD":   "0.10",
     "MAX_SPREAD_PCT":           "0.05",
-    "USE_VWAP_FILTER":          "true",
-    "USE_MAKER_ENTRY":          "false",   # no live orders in simulation
+    "USE_VWAP_FILTER":          "false",  # OB can't be accurately synthesised for back-testing
+    "USE_MAKER_ENTRY":          "false",  # no live orders in simulation
     "MAKER_ENTRY_TIMEOUT_S":    "0",
-    **_ENV,
 })
 
 import logging
@@ -100,50 +85,10 @@ def d(t):  return f"{DIM}{t}{RESET}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Candle generators
+# Candle generator — Geometric Brownian Motion
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_optimistic_candles(n_candles: int = 8000, seed: int = 42) -> list[list]:
-    """
-    Alternating trend cycles with deliberate RSI cool-down phases.
-    Produces clean EMA crossovers at ideal RSI levels (~70% win rate).
-    NOT representative of real markets.
-    """
-    rng = np.random.default_rng(seed)
-    closes: list[float] = [43_000.0]
-
-    def add(n, drift, vol):
-        p = closes[-1]
-        for _ in range(n):
-            p = max(100.0, p * (1.0 + rng.normal(drift, vol)))
-            closes.append(round(p, 2))
-
-    add(40, 0.0, 0.0003)
-    while len(closes) < n_candles:
-        add(8,   0.0,      0.0002)
-        add(30,  0.00030,  0.00040)
-        add(8,   0.0,      0.0002)
-        add(30, -0.00030,  0.00040)
-
-    closes = closes[:n_candles]
-    ts_base = int(time.time()) * 1000 - len(closes) * 60_000
-    candles = []
-    for i, close in enumerate(closes):
-        prev   = closes[i - 1] if i > 0 else close
-        hi_ext = rng.uniform(0.0001, 0.0005) * close
-        lo_ext = rng.uniform(0.0001, 0.0005) * close
-        candles.append([
-            ts_base + i * 60_000,
-            round(prev, 2),
-            round(max(prev, close) + hi_ext, 2),
-            round(min(prev, close) - lo_ext, 2),
-            close,
-            round(rng.uniform(0.5, 5.0), 3),
-        ])
-    return candles
-
-
-def generate_realistic_candles(n_candles: int = 8000, seed: int = 42) -> list[list]:
+def generate_candles(n_candles: int = 8000, seed: int = 42) -> list[list]:
     """
     Geometric Brownian Motion with BTC-realistic parameters.
     No engineered crossovers or RSI resets — genuine market noise.
@@ -160,7 +105,6 @@ def generate_realistic_candles(n_candles: int = 8000, seed: int = 42) -> list[li
     price = 43_000.0
     closes: list[float] = []
 
-    i = 0
     while len(closes) < n_candles:
         # Regime: trend (40%), range (40%), high-vol (20%)
         regime_len = int(rng.integers(20, 80))
@@ -207,20 +151,17 @@ def generate_realistic_candles(n_candles: int = 8000, seed: int = 42) -> list[li
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Slippage model (realistic mode only)
+# Slippage model
 # ══════════════════════════════════════════════════════════════════════════════
 
 def apply_slippage(price: float, side: str, rng) -> float:
-    """
-    Market orders on 1m BTC futures incur 0.02–0.08% slippage.
-    Buyers pay more, sellers receive less.
-    """
+    """Market orders on 1m BTC futures incur 0.02–0.08% slippage."""
     slip = rng.uniform(0.0002, 0.0008)
     return price * (1 + slip) if side == "long" else price * (1 - slip)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Funding rate (realistic mode only)
+# Funding rate
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Phemex charges funding every 8 hours = 480 minutes.
@@ -230,45 +171,6 @@ _FUNDING_PER_CANDLE = 0.0001 / 480   # fraction of notional per 1-minute candle
 
 def funding_cost(notional: float, candles_held: int) -> float:
     return notional * _FUNDING_PER_CANDLE * candles_held
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Synthetic order book (realistic mode)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def synthetic_orderbook(price: float, prev_price: float, rng) -> dict:
-    """
-    Build a plausible 10-level L2 book for simulation.
-
-    Imbalance is weakly correlated with the most recent price return plus
-    Gaussian noise — reflecting real market microstructure where order flow
-    partially predicts short-term direction but is far from deterministic.
-
-    Spread is calibrated to BTC futures: ~0.005–0.020% of mid-price.
-    """
-    spread = price * rng.uniform(0.00005, 0.0002)   # 0.005–0.02%
-    half   = spread / 2
-    best_bid = price - half
-    best_ask = price + half
-
-    # Momentum-based imbalance with heavy noise
-    ret       = (price - prev_price) / prev_price if prev_price > 0 else 0.0
-    base_imb  = float(np.clip(ret * 300, -0.5, 0.5))   # scale tiny returns
-    imbalance = float(np.clip(base_imb + rng.normal(0, 0.25), -1.0, 1.0))
-
-    bid_mult = max(0.05, 1.0 + imbalance)
-    ask_mult = max(0.05, 1.0 - imbalance)
-    tick     = half * 0.4   # spacing between levels
-
-    bids = [
-        [round(best_bid - i * tick, 1), round(rng.uniform(0.05, 3.0) * bid_mult, 4)]
-        for i in range(10)
-    ]
-    asks = [
-        [round(best_ask + i * tick, 1), round(rng.uniform(0.05, 3.0) * ask_mult, 4)]
-        for i in range(10)
-    ]
-    return {"bids": bids, "asks": asks}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -326,37 +228,23 @@ def equity_curve(balances: list[float], target_width: int = 60, height: int = 8)
 W = 76  # display width
 
 
-def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
+def run_simulation(target_trades: int = 100) -> None:
     starting_balance = 100.0
     rng = np.random.default_rng(42)
 
-    if realistic:
-        all_candles = generate_realistic_candles(
-            n_candles=max(20000, target_trades * 200), seed=42
-        )
-    else:
-        all_candles = generate_optimistic_candles(
-            n_candles=max(12000, target_trades * 120), seed=42
-        )
+    all_candles = generate_candles(
+        n_candles=max(20_000, target_trades * 200), seed=42
+    )
 
     strategy = ScalpStrategy()
     rm        = RiskManager(starting_balance)
 
     # ── Header ────────────────────────────────────────────────────────────────
     print(cy("═" * W))
-    if realistic:
-        print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE REALISTIC SIMULATION")))
-        print(cy(f"  GBM price data  │  slippage 0.02–0.08%  │  funding 0.01%/8h"))
-        print(cy(f"  VWAP filter + OB imbalance filter (thresh={Config.OB_IMBALANCE_THRESHOLD:.2f}) "
-                 f"│  max spread {Config.MAX_SPREAD_PCT:.3f}%"))
-        print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  {Config.LEVERAGE}x leverage  │  "
-                 f"Fixed ${Config.TRADE_SIZE_USDT} USDT per trade"))
-    else:
-        effective_x = Config.RISK_PER_TRADE_PCT / 100 * Config.LEVERAGE
-        print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE SIMULATION  [OPTIMISTIC]")))
-        print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  {Config.LEVERAGE}x leverage"))
-        print(cy(f"  Compound sizing: {Config.RISK_PER_TRADE_PCT:.0f}% of balance × "
-                 f"{Config.LEVERAGE}x = {effective_x:.1f}× account exposure per trade"))
+    print(cy(b(f"  PHEMEX SCALP BOT  ─  {target_trades}-TRADE SIMULATION")))
+    print(cy(f"  GBM price data  │  slippage 0.02–0.08%  │  funding 0.01%/8h"))
+    print(cy(f"  {Config.SYMBOL}  │  {Config.TIMEFRAME}  │  {Config.LEVERAGE}x leverage  │  "
+             f"Fixed ${Config.TRADE_SIZE_USDT:.0f} USDT per trade"))
     print(cy(f"  Balance: {starting_balance:,.2f} USDT  │  "
              f"Max session loss: {Config.MAX_SESSION_LOSS_PCT}%  │  "
              f"TP: +{Config.TAKE_PROFIT_PCT}%  │  SL: -{Config.STOP_LOSS_PCT}%"))
@@ -364,12 +252,8 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
     print()
 
     # ── Table header ──────────────────────────────────────────────────────────
-    if realistic:
-        print(d(f"  {'#':>4}  {'Side':<6}  {'Entry':>10}  {'Exit':>10}  "
-                f"{'Result':<10}  {'PnL':>8}  {'Slip+Fund':>9}  {'Balance':>10}"))
-    else:
-        print(d(f"  {'#':>4}  {'Side':<6}  {'Entry':>10}  {'Exit':>10}  "
-                f"{'Result':<10}  {'PnL':>8}  {'Balance':>11}  {'Loss%':>6}"))
+    print(d(f"  {'#':>4}  {'Side':<6}  {'Entry':>10}  {'Exit':>10}  "
+            f"{'Result':<10}  {'PnL':>8}  {'Slip+Fund':>9}  {'Balance':>10}"))
     print(d("  " + "─" * (W - 2)))
 
     # ── State ─────────────────────────────────────────────────────────────────
@@ -395,17 +279,11 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
                 completed += 1
                 pnl = record.pnl_usdt
 
-                # Realistic costs on top of the fee already in register_close
-                extra_costs = 0.0
-                if realistic:
-                    fund  = funding_cost(trade_notional, candles_held)
-                    extra_costs = fund
-                    pnl  -= fund
-                    balance = starting_balance + rm._realised_pnl - fund
-                    # adjust rm internal pnl for display consistency
-                    rm._realised_pnl -= fund
-                else:
-                    balance = starting_balance + rm._realised_pnl
+                # Apply funding cost on top of the fee already in register_close
+                fund        = funding_cost(trade_notional, candles_held)
+                pnl        -= fund
+                balance     = starting_balance + rm._realised_pnl - fund
+                rm._realised_pnl -= fund
 
                 balances.append(balance)
                 tp_hit     = reason == "take_profit"
@@ -413,28 +291,15 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
                 pnl_str    = (g if pnl >= 0 else r)(f"{pnl:>+7.2f}")
                 side_str   = g("LONG  ") if current_trade.side == "long" else r("SHORT ")
 
-                if realistic:
-                    costs_str = f"{extra_costs:>+8.4f}"
-                    print(
-                        f"  {completed:>4}  {side_str}"
-                        f"  {current_trade.entry_price:>10,.2f}"
-                        f"  {exit_price:>10,.2f}"
-                        f"  {result_str}        "
-                        f"{pnl_str}"
-                        f"  {DIM}{costs_str}{RESET}"
-                        f"  {balance:>10,.4f}"
-                    )
-                else:
-                    loss_col = RED if rm.session_loss_pct > 15 else YELLOW if rm.session_loss_pct > 5 else DIM
-                    print(
-                        f"  {completed:>4}  {side_str}"
-                        f"  {current_trade.entry_price:>10,.2f}"
-                        f"  {exit_price:>10,.2f}"
-                        f"  {result_str}        "
-                        f"{pnl_str}"
-                        f"  {balance:>11,.4f}"
-                        f"  {loss_col}{rm.session_loss_pct:>5.1f}%{RESET}"
-                    )
+                print(
+                    f"  {completed:>4}  {side_str}"
+                    f"  {current_trade.entry_price:>10,.2f}"
+                    f"  {exit_price:>10,.2f}"
+                    f"  {result_str}        "
+                    f"{pnl_str}"
+                    f"  {DIM}{fund:>+8.4f}{RESET}"
+                    f"  {balance:>10,.4f}"
+                )
 
                 trade_log.append({
                     "num":   completed,
@@ -444,8 +309,8 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
                     "pnl":   pnl,
                     "tp":    tp_hit,
                 })
-                current_trade = None
-                candles_held  = 0
+                current_trade  = None
+                candles_held   = 0
                 trade_notional = 0.0
 
                 if completed % 10 == 0 and completed < target_trades:
@@ -476,9 +341,9 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
             break
 
         # ── Evaluate strategy ──────────────────────────────────────────────────
-        # Note: orderbook=None in simulation — real L2 OB can't be synthesised
-        # accurately enough to model its predictive benefit.  The live bot fetches
-        # a real order book on every tick and applies the imbalance + spread filters.
+        # orderbook=None: real L2 OB can't be synthesised accurately enough to
+        # model its predictive benefit. The live bot fetches a real order book on
+        # every tick and applies the imbalance + spread filters.
         window_start = max(0, i - 199)
         result = strategy.analyse(all_candles[window_start: i + 1], orderbook=None)
         if result is None or result.signal == Signal.NONE:
@@ -490,23 +355,12 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
 
         # ── Open position ──────────────────────────────────────────────────────
         signal_side = result.signal.value  # 'long' or 'short'
+        fill_price  = apply_slippage(close, signal_side, rng)
 
-        # Apply slippage to get realistic fill price
-        if realistic:
-            fill_price = apply_slippage(close, signal_side, rng)
-        else:
-            fill_price = close
+        notional       = Config.TRADE_SIZE_USDT * Config.LEVERAGE
+        contracts      = round(notional / fill_price, 6)
+        trade_notional = notional
 
-        # Position sizing
-        if Config.RISK_PER_TRADE_PCT > 0:
-            trade_usdt  = balance * (Config.RISK_PER_TRADE_PCT / 100)
-            notional    = trade_usdt * Config.LEVERAGE
-        else:
-            notional    = Config.TRADE_SIZE_USDT * Config.LEVERAGE
-        contracts       = round(notional / fill_price, 6)
-        trade_notional  = notional
-
-        # TP/SL from actual fill price (as the real bot does)
         tp_pct = Config.TAKE_PROFIT_PCT / 100
         sl_pct = Config.STOP_LOSS_PCT   / 100
         if signal_side == "long":
@@ -571,8 +425,7 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
 
     print()
     print(cy("═" * W))
-    mode_tag = "REALISTIC" if realistic else "OPTIMISTIC"
-    print(cy(b(f"  SESSION SUMMARY [{mode_tag}] — {completed} TRADES")))
+    print(cy(b(f"  SESSION SUMMARY — {completed} TRADES")))
     print(cy("═" * W))
 
     bal_col = GREEN if net >= 0 else RED
@@ -601,11 +454,10 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
     row("Session loss",       f"{rm.session_loss_pct:.2f}%  (limit {Config.MAX_SESSION_LOSS_PCT}%)")
     row("Session locked",     str(rm.session_locked))
 
-    if realistic:
-        print()
-        print(d("  Includes: taker fees (0.075%/side) + slippage (0.02–0.08%) + funding (0.01%/8h)"))
-        print(d("  Price data: GBM with regime switching (trend/range/highvol) and fat-tail spikes"))
-        print(d("  Live bot additionally applies real-time OB imbalance + spread filters + maker entry"))
+    print()
+    print(d("  Includes: taker fees (0.075%/side) + slippage (0.02–0.08%) + funding (0.01%/8h)"))
+    print(d("  Price data: GBM with regime switching (trend/range/highvol) + fat-tail spikes"))
+    print(d("  Live bot additionally applies real-time OB imbalance + spread filters + maker entry"))
 
     print()
     print(cy("  Equity Curve  (balance over completed trades)"))
@@ -615,4 +467,4 @@ def run_simulation(target_trades: int = 100, realistic: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    run_simulation(target_trades=_args.trades, realistic=_args.realistic)
+    run_simulation(target_trades=_args.trades)
