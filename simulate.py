@@ -197,7 +197,7 @@ def equity_curve(balances: list[float], target_width: int = 60, height: int = 8)
 W = 76  # display width
 
 def run_simulation(target_trades: int = 100) -> None:
-    starting_balance = 1_000.0
+    starting_balance = 100.0
     all_candles = generate_candles(n_candles=max(12000, target_trades * 120))
 
     strategy = ScalpStrategy()
