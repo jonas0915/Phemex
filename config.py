@@ -63,6 +63,35 @@ class Config:
     # connectivity.  Set False only for paper-trading / testnet debugging.
     USE_EXCHANGE_SL_TP: bool = _get("USE_EXCHANGE_SL_TP", default="true").lower() == "true"
 
+    # ── Order book / L2 filters ───────────────────────────────────────────────
+    # Number of order book price levels to fetch (20 is more than enough)
+    OB_DEPTH: int = _get("OB_DEPTH", default="20", cast=int)
+
+    # Minimum bid/ask volume imbalance required to confirm a signal direction.
+    # imbalance = (bid_vol − ask_vol) / (bid_vol + ask_vol)  ∈ [−1, +1]
+    # LONG entry requires imbalance ≥ +threshold (buy pressure confirmed).
+    # SHORT entry requires imbalance ≤ −threshold (sell pressure confirmed).
+    # Range 0.05–0.20; lower = more signals, higher = fewer but higher quality.
+    OB_IMBALANCE_THRESHOLD: float = _get("OB_IMBALANCE_THRESHOLD", default="0.10", cast=float)
+
+    # Skip entry if bid-ask spread exceeds this % of mid-price.
+    # BTC futures spread is typically 0.002–0.010%; 0.05% is a generous ceiling.
+    MAX_SPREAD_PCT: float = _get("MAX_SPREAD_PCT", default="0.05", cast=float)
+
+    # VWAP filter: only enter LONG when price ≥ VWAP, SHORT when price ≤ VWAP.
+    # Avoids fighting the volume-weighted session trend.
+    # Default false — enable for live trading; synthetic back-tests can't model it well.
+    USE_VWAP_FILTER: bool = _get("USE_VWAP_FILTER", default="false").lower() == "true"
+
+    # ── Smart order execution ─────────────────────────────────────────────────
+    # Try a limit order inside the spread before falling back to market.
+    # Phemex maker fee: −0.025% (rebate); taker fee: +0.075%.
+    # Saving 0.10% per fill is meaningful against a 0.6% TP target.
+    USE_MAKER_ENTRY: bool = _get("USE_MAKER_ENTRY", default="true").lower() == "true"
+
+    # Seconds to wait for limit fill before cancelling and using market order.
+    MAKER_ENTRY_TIMEOUT_S: int = _get("MAKER_ENTRY_TIMEOUT_S", default="10", cast=int)
+
     # ── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = _get("LOG_LEVEL", default="INFO")
     LOG_FILE:  str = _get("LOG_FILE",  default="logs/trading_bot.log")
@@ -131,6 +160,17 @@ class Config:
             errors.append(
                 f"EMA_FAST ({cls.EMA_FAST}) must be less than EMA_SLOW ({cls.EMA_SLOW})"
             )
+
+        if not (0 <= cls.OB_IMBALANCE_THRESHOLD <= 1):
+            errors.append(
+                f"OB_IMBALANCE_THRESHOLD={cls.OB_IMBALANCE_THRESHOLD} must be between 0 and 1"
+            )
+
+        if cls.MAX_SPREAD_PCT <= 0:
+            errors.append(f"MAX_SPREAD_PCT={cls.MAX_SPREAD_PCT} must be > 0")
+
+        if cls.MAKER_ENTRY_TIMEOUT_S < 0:
+            errors.append(f"MAKER_ENTRY_TIMEOUT_S={cls.MAKER_ENTRY_TIMEOUT_S} must be >= 0")
 
         supported_tf = ("1m", "3m", "5m", "15m", "30m", "1h")
         if cls.TIMEFRAME not in supported_tf:

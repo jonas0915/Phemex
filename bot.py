@@ -66,6 +66,11 @@ def main() -> None:
                  Config.TRADE_SIZE_USDT * Config.LEVERAGE)
     log.info("Max loss    : %.1f%%", Config.MAX_SESSION_LOSS_PCT)
     log.info("Native SL/TP: %s", Config.USE_EXCHANGE_SL_TP)
+    log.info("VWAP filter : %s", Config.USE_VWAP_FILTER)
+    log.info("OB filter   : depth=%d  imb_thresh=%.2f  max_spread=%.3f%%",
+             Config.OB_DEPTH, Config.OB_IMBALANCE_THRESHOLD, Config.MAX_SPREAD_PCT)
+    log.info("Maker entry : %s  (timeout %ds)",
+             Config.USE_MAKER_ENTRY, Config.MAKER_ENTRY_TIMEOUT_S)
     log.info("Testnet     : %s", Config.TESTNET)
     log.info("=" * 60)
 

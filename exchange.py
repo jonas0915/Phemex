@@ -145,6 +145,27 @@ class PhemexExchange:
             log.warning("Could not fetch positions: %s", exc)
             return []
 
+    def fetch_order_book(self, depth: int = 20) -> dict:
+        """
+        Return L2 order book snapshot.
+        {"bids": [[price, size], ...], "asks": [[price, size], ...]}
+        Bids are sorted descending (highest first); asks ascending (lowest first).
+        Returns empty book dict on failure so callers can treat missing OB gracefully.
+        """
+        try:
+            return self._call(self._exchange.fetch_order_book, Config.SYMBOL, depth)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_order_book failed: %s", exc)
+            return {"bids": [], "asks": []}
+
+    def fetch_order_status(self, order_id: str) -> Optional[dict]:
+        """Fetch a single order by ID. Returns None on failure."""
+        try:
+            return self._call(self._exchange.fetch_order, order_id, Config.SYMBOL)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_order_status %s failed: %s", order_id, exc)
+            return None
+
     def fetch_open_orders(self) -> list[dict]:
         return self._call(self._exchange.fetch_open_orders, Config.SYMBOL)
 
