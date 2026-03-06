@@ -31,7 +31,7 @@ class Config:
     SYMBOL:          str   = _get("TRADING_SYMBOL",    default="BTC/USDT:USDT")
     TIMEFRAME:       str   = _get("TRADING_TIMEFRAME", default="1m")
     TRADE_SIZE_USDT: float = _get("TRADE_SIZE_USDT",   default="100",  cast=float)
-    LEVERAGE:        int   = _get("LEVERAGE",           default="5",    cast=int)
+    LEVERAGE:        int   = _get("LEVERAGE",           default="10",   cast=int)
 
     # ── Strategy ─────────────────────────────────────────────────────────────
     EMA_FAST:       int   = _get("EMA_FAST",       default="9",  cast=int)
@@ -171,8 +171,8 @@ class Config:
         """
         errors: list[str] = []
 
-        if cls.LEVERAGE < 1 or cls.LEVERAGE > 100:
-            errors.append(f"LEVERAGE={cls.LEVERAGE} must be between 1 and 100")
+        if cls.LEVERAGE < 10 or cls.LEVERAGE > 100:
+            errors.append(f"LEVERAGE={cls.LEVERAGE} must be between 10 and 100")
 
         if cls.TAKE_PROFIT_PCT <= 0:
             errors.append(f"TAKE_PROFIT_PCT={cls.TAKE_PROFIT_PCT} must be > 0")
